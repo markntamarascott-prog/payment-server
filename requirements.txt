@@ -1,0 +1,4 @@
+flask
+stripe
+psycopg2-binary
+gunicorn
