@@ -11,9 +11,13 @@ try:
     import psycopg2.extras
 except Exception:
     psycopg2 = None
+    try:
+        import psycopg2_binary  # noqa: F401
+    except Exception:
+        pass
 
 
-APP_VERSION = "V10.13-webhook-fix"
+APP_VERSION = "V10.13-webhook-fix-db-compatible"
 
 app = Flask(__name__)
 
@@ -30,10 +34,6 @@ if STRIPE_SECRET_KEY:
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
-
-
-def database_configured():
-    return bool(DATABASE_URL)
 
 
 def postgres_available():
@@ -71,6 +71,26 @@ def get_db_connection():
     return sqlite3.connect(get_sqlite_path())
 
 
+def postgres_column_exists(cur, table_name, column_name):
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = %s
+          AND column_name = %s
+        LIMIT 1
+        """,
+        (table_name, column_name),
+    )
+    return cur.fetchone() is not None
+
+
+def sqlite_column_exists(cur, table_name, column_name):
+    cur.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cur.fetchall()]
+    return column_name in columns
+
+
 def init_db():
     if postgres_available():
         conn = get_db_connection()
@@ -80,19 +100,30 @@ def init_db():
                     """
                     CREATE TABLE IF NOT EXISTS payments (
                         session_id TEXT PRIMARY KEY,
-                        report_id TEXT,
-                        amount_total INTEGER DEFAULT 0,
-                        recovery_total TEXT DEFAULT '',
-                        app_name TEXT DEFAULT '',
-                        app_version TEXT DEFAULT '',
-                        paid BOOLEAN DEFAULT FALSE,
-                        payment_status TEXT DEFAULT '',
-                        customer_email TEXT DEFAULT '',
-                        created_at TEXT,
-                        updated_at TEXT
+                        status TEXT DEFAULT '',
+                        amount_cents INTEGER DEFAULT 0,
+                        report_id TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        paid_at TIMESTAMPTZ
                     )
                     """
                 )
+
+                migrations = [
+                    ("recovery_total", "TEXT DEFAULT ''"),
+                    ("app_name", "TEXT DEFAULT ''"),
+                    ("app_version", "TEXT DEFAULT ''"),
+                    ("payment_status", "TEXT DEFAULT ''"),
+                    ("customer_email", "TEXT DEFAULT ''"),
+                    ("updated_at", "TIMESTAMPTZ"),
+                ]
+
+                for column_name, column_type in migrations:
+                    if not postgres_column_exists(cur, "payments", column_name):
+                        cur.execute(
+                            f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
+                        )
+
             conn.commit()
         finally:
             conn.close()
@@ -104,19 +135,30 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS payments (
                     session_id TEXT PRIMARY KEY,
-                    report_id TEXT,
-                    amount_total INTEGER DEFAULT 0,
-                    recovery_total TEXT DEFAULT '',
-                    app_name TEXT DEFAULT '',
-                    app_version TEXT DEFAULT '',
-                    paid INTEGER DEFAULT 0,
-                    payment_status TEXT DEFAULT '',
-                    customer_email TEXT DEFAULT '',
+                    status TEXT DEFAULT '',
+                    amount_cents INTEGER DEFAULT 0,
+                    report_id TEXT DEFAULT '',
                     created_at TEXT,
-                    updated_at TEXT
+                    paid_at TEXT
                 )
                 """
             )
+
+            migrations = [
+                ("recovery_total", "TEXT DEFAULT ''"),
+                ("app_name", "TEXT DEFAULT ''"),
+                ("app_version", "TEXT DEFAULT ''"),
+                ("payment_status", "TEXT DEFAULT ''"),
+                ("customer_email", "TEXT DEFAULT ''"),
+                ("updated_at", "TEXT"),
+            ]
+
+            for column_name, column_type in migrations:
+                if not sqlite_column_exists(cur, "payments", column_name):
+                    cur.execute(
+                        f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
+                    )
+
             conn.commit()
         finally:
             conn.close()
@@ -125,7 +167,7 @@ def init_db():
 def upsert_payment(
     session_id,
     report_id="",
-    amount_total=0,
+    amount_cents=0,
     recovery_total="",
     app_name="",
     app_version="",
@@ -135,6 +177,8 @@ def upsert_payment(
 ):
     init_db()
     now = utc_now_iso()
+    status_value = "paid" if paid else (payment_status or "created")
+    paid_at_value = now if paid else None
 
     if postgres_available():
         conn = get_db_connection()
@@ -144,47 +188,52 @@ def upsert_payment(
                     """
                     INSERT INTO payments (
                         session_id,
+                        status,
+                        amount_cents,
                         report_id,
-                        amount_total,
+                        created_at,
+                        paid_at,
                         recovery_total,
                         app_name,
                         app_version,
-                        paid,
                         payment_status,
                         customer_email,
-                        created_at,
                         updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (session_id) DO UPDATE SET
+                        status = CASE
+                            WHEN EXCLUDED.status = 'paid' THEN 'paid'
+                            WHEN payments.status = 'paid' THEN payments.status
+                            ELSE EXCLUDED.status
+                        END,
+                        amount_cents = CASE
+                            WHEN EXCLUDED.amount_cents > 0 THEN EXCLUDED.amount_cents
+                            ELSE payments.amount_cents
+                        END,
                         report_id = COALESCE(NULLIF(EXCLUDED.report_id, ''), payments.report_id),
-                        amount_total = CASE
-                            WHEN EXCLUDED.amount_total > 0 THEN EXCLUDED.amount_total
-                            ELSE payments.amount_total
+                        paid_at = CASE
+                            WHEN EXCLUDED.paid_at IS NOT NULL THEN EXCLUDED.paid_at
+                            ELSE payments.paid_at
                         END,
                         recovery_total = COALESCE(NULLIF(EXCLUDED.recovery_total, ''), payments.recovery_total),
                         app_name = COALESCE(NULLIF(EXCLUDED.app_name, ''), payments.app_name),
                         app_version = COALESCE(NULLIF(EXCLUDED.app_version, ''), payments.app_version),
-                        paid = CASE
-                            WHEN EXCLUDED.paid = TRUE THEN TRUE
-                            ELSE payments.paid
-                        END,
                         payment_status = COALESCE(NULLIF(EXCLUDED.payment_status, ''), payments.payment_status),
                         customer_email = COALESCE(NULLIF(EXCLUDED.customer_email, ''), payments.customer_email),
-                        updated_at = EXCLUDED.updated_at
+                        updated_at = NOW()
                     """,
                     (
                         session_id,
+                        status_value,
+                        int(amount_cents or 0),
                         report_id,
-                        int(amount_total or 0),
+                        paid_at_value,
                         str(recovery_total or ""),
                         app_name,
                         app_version,
-                        bool(paid),
                         payment_status,
                         customer_email,
-                        now,
-                        now,
                     ),
                 )
             conn.commit()
@@ -195,7 +244,7 @@ def upsert_payment(
         try:
             cur = conn.cursor()
             existing = cur.execute(
-                "SELECT * FROM payments WHERE session_id = ?",
+                "SELECT session_id FROM payments WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
 
@@ -204,29 +253,37 @@ def upsert_payment(
                     """
                     UPDATE payments
                     SET
+                        status = CASE
+                            WHEN ? = 'paid' THEN 'paid'
+                            WHEN status = 'paid' THEN status
+                            ELSE ?
+                        END,
+                        amount_cents = CASE WHEN ? > 0 THEN ? ELSE amount_cents END,
                         report_id = CASE WHEN ? != '' THEN ? ELSE report_id END,
-                        amount_total = CASE WHEN ? > 0 THEN ? ELSE amount_total END,
+                        paid_at = CASE WHEN ? IS NOT NULL THEN ? ELSE paid_at END,
                         recovery_total = CASE WHEN ? != '' THEN ? ELSE recovery_total END,
                         app_name = CASE WHEN ? != '' THEN ? ELSE app_name END,
                         app_version = CASE WHEN ? != '' THEN ? ELSE app_version END,
-                        paid = CASE WHEN ? = 1 THEN 1 ELSE paid END,
                         payment_status = CASE WHEN ? != '' THEN ? ELSE payment_status END,
                         customer_email = CASE WHEN ? != '' THEN ? ELSE customer_email END,
                         updated_at = ?
                     WHERE session_id = ?
                     """,
                     (
+                        status_value,
+                        status_value,
+                        int(amount_cents or 0),
+                        int(amount_cents or 0),
                         report_id,
                         report_id,
-                        int(amount_total or 0),
-                        int(amount_total or 0),
+                        paid_at_value,
+                        paid_at_value,
                         str(recovery_total or ""),
                         str(recovery_total or ""),
                         app_name,
                         app_name,
                         app_version,
                         app_version,
-                        1 if paid else 0,
                         payment_status,
                         payment_status,
                         customer_email,
@@ -240,30 +297,32 @@ def upsert_payment(
                     """
                     INSERT INTO payments (
                         session_id,
+                        status,
+                        amount_cents,
                         report_id,
-                        amount_total,
+                        created_at,
+                        paid_at,
                         recovery_total,
                         app_name,
                         app_version,
-                        paid,
                         payment_status,
                         customer_email,
-                        created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
+                        status_value,
+                        int(amount_cents or 0),
                         report_id,
-                        int(amount_total or 0),
+                        now,
+                        paid_at_value,
                         str(recovery_total or ""),
                         app_name,
                         app_version,
-                        1 if paid else 0,
                         payment_status,
                         customer_email,
-                        now,
                         now,
                     ),
                 )
@@ -301,23 +360,24 @@ def get_payment(session_id):
         conn.close()
 
 
-def bool_from_db(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value == 1
-    if isinstance(value, str):
-        return value.lower() in {"true", "1", "yes", "paid"}
-    return False
+def payment_row_is_paid(row):
+    if not row:
+        return False
+
+    status = str(row.get("status", "") or "").lower()
+    payment_status = str(row.get("payment_status", "") or "").lower()
+    paid_at = row.get("paid_at")
+
+    return status == "paid" or payment_status == "paid" or bool(paid_at)
 
 
 @app.route("/", methods=["GET"])
 def index():
     try:
         init_db()
-        db_ok = True
+        db_ready = True
     except Exception:
-        db_ok = False
+        db_ready = False
 
     return jsonify(
         {
@@ -325,7 +385,7 @@ def index():
             "version": APP_VERSION,
             "stripe_configured": bool(STRIPE_SECRET_KEY),
             "database_configured": bool(DATABASE_URL),
-            "database_ready": db_ok,
+            "database_ready": db_ready,
             "webhook_secret_configured": bool(STRIPE_WEBHOOK_SECRET),
         }
     )
@@ -407,7 +467,7 @@ def create_checkout_session():
         upsert_payment(
             session_id=session_id,
             report_id=report_id,
-            amount_total=amount_cents,
+            amount_cents=amount_cents,
             recovery_total=recovery_total,
             app_name=app_name,
             app_version=app_version,
@@ -424,7 +484,7 @@ def create_checkout_session():
             }
         )
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": str(exc), "version": APP_VERSION}), 500
 
 
 @app.route("/check-payment/<session_id>", methods=["GET"])
@@ -440,18 +500,20 @@ def check_payment(session_id):
                 "paid": False,
                 "session_id": session_id,
                 "payment_status": "not_found",
+                "version": APP_VERSION,
             }
         )
 
     return jsonify(
         {
-            "paid": bool_from_db(row.get("paid")),
+            "paid": payment_row_is_paid(row),
             "session_id": session_id,
             "report_id": row.get("report_id", ""),
-            "amount_total": row.get("amount_total", 0),
-            "payment_status": row.get("payment_status", ""),
+            "amount_cents": row.get("amount_cents", 0),
+            "payment_status": row.get("payment_status", "") or row.get("status", ""),
             "customer_email": row.get("customer_email", ""),
-            "updated_at": row.get("updated_at", ""),
+            "updated_at": str(row.get("updated_at", "") or ""),
+            "version": APP_VERSION,
         }
     )
 
@@ -459,7 +521,7 @@ def check_payment(session_id):
 @app.route("/webhook", methods=["POST"])
 def stripe_webhook():
     if not STRIPE_WEBHOOK_SECRET:
-        return jsonify({"error": "Stripe webhook secret is not configured."}), 500
+        return jsonify({"error": "Stripe webhook secret is not configured.", "version": APP_VERSION}), 500
 
     payload = request.data
     signature = request.headers.get("Stripe-Signature", "")
@@ -471,11 +533,11 @@ def stripe_webhook():
             secret=STRIPE_WEBHOOK_SECRET,
         )
     except ValueError:
-        return jsonify({"error": "Invalid payload."}), 400
+        return jsonify({"error": "Invalid payload.", "version": APP_VERSION}), 400
     except stripe.error.SignatureVerificationError:
-        return jsonify({"error": "Invalid signature."}), 400
+        return jsonify({"error": "Invalid signature.", "version": APP_VERSION}), 400
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": str(exc), "version": APP_VERSION}), 400
 
     try:
         event_type = event["type"]
@@ -484,7 +546,7 @@ def stripe_webhook():
             session = event["data"]["object"]
 
             session_id = session["id"]
-            amount_total = int(session["amount_total"] or 0)
+            amount_cents = int(session["amount_total"] or 0)
             payment_status = session["payment_status"] if "payment_status" in session else "paid"
 
             metadata = session["metadata"] if "metadata" in session else {}
@@ -501,7 +563,7 @@ def stripe_webhook():
             upsert_payment(
                 session_id=session_id,
                 report_id=report_id,
-                amount_total=amount_total,
+                amount_cents=amount_cents,
                 recovery_total=recovery_total,
                 app_name=app_name,
                 app_version=app_version,
