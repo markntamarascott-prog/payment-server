@@ -1,6 +1,9 @@
+import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
 
 from flask import Flask, jsonify, request
@@ -17,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.13-webhook-fix-db-compatible"
+APP_VERSION = "V10.23-founder-pilot-cloud-capture"
 
 app = Flask(__name__)
 
@@ -27,13 +30,61 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()
 SUCCESS_URL = os.environ.get("SUCCESS_URL", "").strip()
 CANCEL_URL = os.environ.get("CANCEL_URL", "").strip()
+FOUNDER_ADMIN_TOKEN = os.environ.get("FOUNDER_ADMIN_TOKEN", "").strip()
+FOUNDER_CODE_SECRET = os.environ.get("FOUNDER_CODE_SECRET", FOUNDER_ADMIN_TOKEN or STRIPE_WEBHOOK_SECRET or "dev-founder-secret").strip()
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def normalize_email(value):
+    return str(value or "").strip().lower()
+
+
+def normalize_code(value):
+    return str(value or "").strip().upper()
+
+
+def code_hash(founder_code):
+    normalized = normalize_code(founder_code)
+    return hmac.new(
+        FOUNDER_CODE_SECRET.encode("utf-8"),
+        normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def generate_founder_code(email):
+    local_part = normalize_email(email).split("@")[0] or "FOUNDER"
+    safe_name = "".join(ch for ch in local_part.upper() if ch.isalnum())[:12] or "FOUNDER"
+    suffix = secrets.token_hex(2).upper()
+    year = utc_now().year
+    return f"FOUNDER-{safe_name}-{year}-{suffix}"
 
 
 def postgres_available():
@@ -91,6 +142,16 @@ def sqlite_column_exists(cur, table_name, column_name):
     return column_name in columns
 
 
+def sqlite_add_column_if_missing(cur, table_name, column_name, column_type):
+    if not sqlite_column_exists(cur, table_name, column_name):
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
+def postgres_add_column_if_missing(cur, table_name, column_name, column_type):
+    if not postgres_column_exists(cur, table_name, column_name):
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+
 def init_db():
     if postgres_available():
         conn = get_db_connection()
@@ -109,7 +170,7 @@ def init_db():
                     """
                 )
 
-                migrations = [
+                payment_migrations = [
                     ("recovery_total", "TEXT DEFAULT ''"),
                     ("app_name", "TEXT DEFAULT ''"),
                     ("app_version", "TEXT DEFAULT ''"),
@@ -117,13 +178,61 @@ def init_db():
                     ("customer_email", "TEXT DEFAULT ''"),
                     ("updated_at", "TIMESTAMPTZ"),
                 ]
+                for column_name, column_type in payment_migrations:
+                    postgres_add_column_if_missing(cur, "payments", column_name, column_type)
 
-                for column_name, column_type in migrations:
-                    if not postgres_column_exists(cur, "payments", column_name):
-                        cur.execute(
-                            f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
-                        )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS founding_members (
+                        code_hash TEXT PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        active BOOLEAN DEFAULT TRUE,
+                        notes TEXT DEFAULT '',
+                        last_validated_at TIMESTAMPTZ,
+                        validation_count INTEGER DEFAULT 0
+                    )
+                    """
+                )
 
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS report_statistics (
+                        report_id TEXT PRIMARY KEY,
+                        email TEXT DEFAULT '',
+                        founder_code_hash TEXT DEFAULT '',
+                        app_name TEXT DEFAULT '',
+                        app_version TEXT DEFAULT '',
+                        scan_date TIMESTAMPTZ DEFAULT NOW(),
+                        orders_found INTEGER DEFAULT 0,
+                        tracking_found INTEGER DEFAULT 0,
+                        tax_identified TEXT DEFAULT '',
+                        paid_scan BOOLEAN DEFAULT FALSE,
+                        generated_package BOOLEAN DEFAULT FALSE,
+                        source TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS refund_outcomes (
+                        report_id TEXT PRIMARY KEY,
+                        email TEXT DEFAULT '',
+                        amazon_submission_date TIMESTAMPTZ,
+                        status TEXT DEFAULT 'Not Submitted',
+                        refund_amount TEXT DEFAULT '',
+                        resolution_date TIMESTAMPTZ,
+                        verification_evidence_status TEXT DEFAULT '',
+                        notes TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
             conn.commit()
         finally:
             conn.close()
@@ -144,7 +253,7 @@ def init_db():
                 """
             )
 
-            migrations = [
+            payment_migrations = [
                 ("recovery_total", "TEXT DEFAULT ''"),
                 ("app_name", "TEXT DEFAULT ''"),
                 ("app_version", "TEXT DEFAULT ''"),
@@ -152,13 +261,61 @@ def init_db():
                 ("customer_email", "TEXT DEFAULT ''"),
                 ("updated_at", "TEXT"),
             ]
+            for column_name, column_type in payment_migrations:
+                sqlite_add_column_if_missing(cur, "payments", column_name, column_type)
 
-            for column_name, column_type in migrations:
-                if not sqlite_column_exists(cur, "payments", column_name):
-                    cur.execute(
-                        f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
-                    )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS founding_members (
+                    code_hash TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    created_at TEXT,
+                    expires_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    notes TEXT DEFAULT '',
+                    last_validated_at TEXT,
+                    validation_count INTEGER DEFAULT 0
+                )
+                """
+            )
 
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_statistics (
+                    report_id TEXT PRIMARY KEY,
+                    email TEXT DEFAULT '',
+                    founder_code_hash TEXT DEFAULT '',
+                    app_name TEXT DEFAULT '',
+                    app_version TEXT DEFAULT '',
+                    scan_date TEXT,
+                    orders_found INTEGER DEFAULT 0,
+                    tracking_found INTEGER DEFAULT 0,
+                    tax_identified TEXT DEFAULT '',
+                    paid_scan INTEGER DEFAULT 0,
+                    generated_package INTEGER DEFAULT 0,
+                    source TEXT DEFAULT '',
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS refund_outcomes (
+                    report_id TEXT PRIMARY KEY,
+                    email TEXT DEFAULT '',
+                    amazon_submission_date TEXT,
+                    status TEXT DEFAULT 'Not Submitted',
+                    refund_amount TEXT DEFAULT '',
+                    resolution_date TEXT,
+                    verification_evidence_status TEXT DEFAULT '',
+                    notes TEXT DEFAULT '',
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
             conn.commit()
         finally:
             conn.close()
@@ -371,6 +528,92 @@ def payment_row_is_paid(row):
     return status == "paid" or payment_status == "paid" or bool(paid_at)
 
 
+def validate_founder_credentials(founder_code, email):
+    init_db()
+    founder_code = normalize_code(founder_code)
+    email = normalize_email(email)
+    if not founder_code or not email:
+        return False, "Founder code and email are required.", None
+
+    hashed_code = code_hash(founder_code)
+    now = utc_now()
+
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM founding_members WHERE code_hash = %s",
+                    (hashed_code,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "Founder code was not found.", None
+                row = dict(row)
+                if normalize_email(row.get("email")) != email:
+                    return False, "Founder code does not match this email.", row
+                if not bool(row.get("active")):
+                    return False, "Founder code is inactive.", row
+                expires_at = row.get("expires_at")
+                if expires_at and expires_at < now:
+                    return False, "Founder code is expired.", row
+                cur.execute(
+                    """
+                    UPDATE founding_members
+                    SET last_validated_at = NOW(),
+                        validation_count = COALESCE(validation_count, 0) + 1
+                    WHERE code_hash = %s
+                    """,
+                    (hashed_code,),
+                )
+            conn.commit()
+            return True, "Founder code is valid.", row
+        finally:
+            conn.close()
+
+    conn = get_db_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT * FROM founding_members WHERE code_hash = ?",
+            (hashed_code,),
+        ).fetchone()
+        if not row:
+            return False, "Founder code was not found.", None
+        row = dict(row)
+        if normalize_email(row.get("email")) != email:
+            return False, "Founder code does not match this email.", row
+        if int(row.get("active") or 0) != 1:
+            return False, "Founder code is inactive.", row
+        expires_at = parse_iso_datetime(row.get("expires_at"))
+        if expires_at and expires_at < now:
+            return False, "Founder code is expired.", row
+        cur.execute(
+            """
+            UPDATE founding_members
+            SET last_validated_at = ?,
+                validation_count = COALESCE(validation_count, 0) + 1
+            WHERE code_hash = ?
+            """,
+            (utc_now_iso(), hashed_code),
+        )
+        conn.commit()
+        return True, "Founder code is valid.", row
+    finally:
+        conn.close()
+
+
+def admin_authorized():
+    if not FOUNDER_ADMIN_TOKEN:
+        return False
+    supplied = request.headers.get("X-Admin-Token", "").strip()
+    auth_header = request.headers.get("Authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        supplied = auth_header[7:].strip()
+    return hmac.compare_digest(supplied, FOUNDER_ADMIN_TOKEN)
+
+
 @app.route("/", methods=["GET"])
 def index():
     try:
@@ -387,6 +630,7 @@ def index():
             "database_configured": bool(DATABASE_URL),
             "database_ready": db_ready,
             "webhook_secret_configured": bool(STRIPE_WEBHOOK_SECRET),
+            "founder_admin_configured": bool(FOUNDER_ADMIN_TOKEN),
         }
     )
 
@@ -409,6 +653,281 @@ def payment_cancelled():
     return (
         "Payment cancelled. Return to the Amazon-MaxShipping Tracker app if you want to try again.",
         200,
+    )
+
+
+@app.route("/admin/create-founder-code", methods=["POST"])
+def create_founder_code():
+    if not admin_authorized():
+        return jsonify({"error": "Unauthorized.", "version": APP_VERSION}), 401
+
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON payload.", "version": APP_VERSION}), 400
+
+    email = normalize_email(payload.get("email"))
+    if not email:
+        return jsonify({"error": "email is required.", "version": APP_VERSION}), 400
+
+    founder_code = normalize_code(payload.get("founder_code") or generate_founder_code(email))
+    expires_at_text = str(payload.get("expires_at", "") or "").strip()
+    expires_at = parse_iso_datetime(expires_at_text) if expires_at_text else utc_now() + timedelta(days=365)
+    notes = str(payload.get("notes", "") or "").strip()
+    hashed_code = code_hash(founder_code)
+
+    init_db()
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO founding_members (
+                        code_hash,
+                        email,
+                        created_at,
+                        expires_at,
+                        active,
+                        notes,
+                        validation_count
+                    )
+                    VALUES (%s, %s, NOW(), %s, TRUE, %s, 0)
+                    ON CONFLICT (code_hash) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        expires_at = EXCLUDED.expires_at,
+                        active = TRUE,
+                        notes = EXCLUDED.notes
+                    """,
+                    (hashed_code, email, expires_at, notes),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO founding_members (
+                    code_hash,
+                    email,
+                    created_at,
+                    expires_at,
+                    active,
+                    notes,
+                    validation_count
+                )
+                VALUES (?, ?, ?, ?, 1, ?, 0)
+                """,
+                (hashed_code, email, utc_now_iso(), expires_at.isoformat(), notes),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return jsonify(
+        {
+            "created": True,
+            "founder_code": founder_code,
+            "email": email,
+            "expires_at": expires_at.isoformat(),
+            "version": APP_VERSION,
+        }
+    )
+
+
+@app.route("/validate-founder-code", methods=["POST"])
+def validate_founder_code():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return jsonify({"valid": False, "error": "Invalid JSON payload.", "version": APP_VERSION}), 400
+
+    founder_code = payload.get("founder_code", "")
+    email = payload.get("email", "")
+    valid, message, row = validate_founder_credentials(founder_code, email)
+
+    expires_at = ""
+    if row and row.get("expires_at"):
+        expires_at = str(row.get("expires_at"))
+
+    return jsonify(
+        {
+            "valid": bool(valid),
+            "message": message,
+            "email": normalize_email(email),
+            "expires_at": expires_at,
+            "membership_type": "Founding Member" if valid else "",
+            "version": APP_VERSION,
+        }
+    )
+
+
+@app.route("/record-report-statistics", methods=["POST"])
+def record_report_statistics():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return jsonify({"recorded": False, "error": "Invalid JSON payload.", "version": APP_VERSION}), 400
+
+    report_id = str(payload.get("report_id", "") or "").strip()
+    if not report_id:
+        return jsonify({"recorded": False, "error": "report_id is required.", "version": APP_VERSION}), 400
+
+    email = normalize_email(payload.get("email"))
+    founder_code = normalize_code(payload.get("founder_code"))
+    founder_code_hash = ""
+    if founder_code:
+        valid, message, _row = validate_founder_credentials(founder_code, email)
+        if not valid:
+            return jsonify({"recorded": False, "error": message, "version": APP_VERSION}), 403
+        founder_code_hash = code_hash(founder_code)
+
+    app_name = str(payload.get("app_name", "AMAZON-MAXSHIPPING TRACKER") or "").strip()
+    app_version = str(payload.get("app_version", "") or "").strip()
+    source = str(payload.get("source", "desktop_app") or "").strip()
+    scan_date = parse_iso_datetime(payload.get("scan_date")) or utc_now()
+
+    try:
+        orders_found = int(payload.get("orders_found", 0) or 0)
+    except Exception:
+        orders_found = 0
+    try:
+        tracking_found = int(payload.get("tracking_found", 0) or 0)
+    except Exception:
+        tracking_found = 0
+
+    tax_identified = str(payload.get("tax_identified", "") or "").strip()
+    paid_scan = bool(payload.get("paid_scan", False))
+    generated_package = bool(payload.get("generated_package", False))
+
+    init_db()
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO report_statistics (
+                        report_id,
+                        email,
+                        founder_code_hash,
+                        app_name,
+                        app_version,
+                        scan_date,
+                        orders_found,
+                        tracking_found,
+                        tax_identified,
+                        paid_scan,
+                        generated_package,
+                        source,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (report_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        founder_code_hash = EXCLUDED.founder_code_hash,
+                        app_name = EXCLUDED.app_name,
+                        app_version = EXCLUDED.app_version,
+                        scan_date = EXCLUDED.scan_date,
+                        orders_found = EXCLUDED.orders_found,
+                        tracking_found = EXCLUDED.tracking_found,
+                        tax_identified = EXCLUDED.tax_identified,
+                        paid_scan = EXCLUDED.paid_scan,
+                        generated_package = EXCLUDED.generated_package,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                    """,
+                    (
+                        report_id,
+                        email,
+                        founder_code_hash,
+                        app_name,
+                        app_version,
+                        scan_date,
+                        orders_found,
+                        tracking_found,
+                        tax_identified,
+                        paid_scan,
+                        generated_package,
+                        source,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO refund_outcomes (report_id, email, status, created_at, updated_at)
+                    VALUES (%s, %s, 'Not Submitted', NOW(), NOW())
+                    ON CONFLICT (report_id) DO NOTHING
+                    """,
+                    (report_id, email),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            now = utc_now_iso()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO report_statistics (
+                    report_id,
+                    email,
+                    founder_code_hash,
+                    app_name,
+                    app_version,
+                    scan_date,
+                    orders_found,
+                    tracking_found,
+                    tax_identified,
+                    paid_scan,
+                    generated_package,
+                    source,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM report_statistics WHERE report_id = ?), ?), ?)
+                """,
+                (
+                    report_id,
+                    email,
+                    founder_code_hash,
+                    app_name,
+                    app_version,
+                    scan_date.isoformat(),
+                    orders_found,
+                    tracking_found,
+                    tax_identified,
+                    1 if paid_scan else 0,
+                    1 if generated_package else 0,
+                    source,
+                    report_id,
+                    now,
+                    now,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO refund_outcomes (report_id, email, status, created_at, updated_at)
+                VALUES (?, ?, 'Not Submitted', ?, ?)
+                """,
+                (report_id, email, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return jsonify(
+        {
+            "recorded": True,
+            "report_id": report_id,
+            "email": email,
+            "version": APP_VERSION,
+        }
     )
 
 
