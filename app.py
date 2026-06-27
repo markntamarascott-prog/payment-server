@@ -20,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.25.1-founder-schema-migration"
+APP_VERSION = "V10.25.2-founder-code-upsert-fix"
 
 app = Flask(__name__)
 
@@ -919,6 +919,14 @@ def mark_founder_validated(founder_code):
 
 
 def create_or_update_founder_code(founder_code, email, expires_at, notes="", active=True, membership_type="Founding Member"):
+    """Create or update an access/founder code without relying on ON CONFLICT.
+
+    Some existing production databases were created before founder_code had a
+    formal UNIQUE/PRIMARY KEY constraint. PostgreSQL will reject
+    ON CONFLICT(founder_code) unless that exact constraint exists. This manual
+    select-then-update/insert path is safer for migrated databases and avoids
+    destructive schema changes.
+    """
     init_db()
     founder_code = normalize_code(founder_code)
     email = normalize_email(email)
@@ -931,20 +939,33 @@ def create_or_update_founder_code(founder_code, email, expires_at, notes="", act
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO founding_members (
-                        founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
-                    )
-                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, 0)
-                    ON CONFLICT (founder_code) DO UPDATE SET
-                        email = EXCLUDED.email,
-                        membership_type = EXCLUDED.membership_type,
-                        active = EXCLUDED.active,
-                        expires_at = EXCLUDED.expires_at,
-                        notes = EXCLUDED.notes
-                    """,
-                    (founder_code, email, membership_type, active_value, expires_at, notes),
+                    "SELECT founder_code FROM founding_members WHERE founder_code = %s LIMIT 1",
+                    (founder_code,),
                 )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE founding_members
+                        SET email = %s,
+                            membership_type = %s,
+                            active = %s,
+                            expires_at = %s,
+                            notes = %s
+                        WHERE founder_code = %s
+                        """,
+                        (email, membership_type, active_value, expires_at, notes, founder_code),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO founding_members (
+                            founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
+                        )
+                        VALUES (%s, %s, %s, %s, NOW(), %s, %s, 0)
+                        """,
+                        (founder_code, email, membership_type, active_value, expires_at, notes),
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -953,21 +974,33 @@ def create_or_update_founder_code(founder_code, email, expires_at, notes="", act
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO founding_members (
-                founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
+        existing = cur.execute(
+            "SELECT founder_code FROM founding_members WHERE founder_code = ? LIMIT 1",
+            (founder_code,),
+        ).fetchone()
+        if existing:
+            cur.execute(
+                """
+                UPDATE founding_members
+                SET email = ?,
+                    membership_type = ?,
+                    active = ?,
+                    expires_at = ?,
+                    notes = ?
+                WHERE founder_code = ?
+                """,
+                (email, membership_type, 1 if active_value else 0, expires_at, notes, founder_code),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-            ON CONFLICT(founder_code) DO UPDATE SET
-                email = excluded.email,
-                membership_type = excluded.membership_type,
-                active = excluded.active,
-                expires_at = excluded.expires_at,
-                notes = excluded.notes
-            """,
-            (founder_code, email, membership_type, 1 if active_value else 0, utc_now_iso(), expires_at, notes),
-        )
+        else:
+            cur.execute(
+                """
+                INSERT INTO founding_members (
+                    founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (founder_code, email, membership_type, 1 if active_value else 0, utc_now_iso(), expires_at, notes),
+            )
         conn.commit()
     finally:
         conn.close()
