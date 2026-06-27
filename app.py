@@ -20,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.25-customer-claimant-profiles"
+APP_VERSION = "V10.25.1-founder-schema-migration"
 
 app = Flask(__name__)
 
@@ -123,6 +123,109 @@ def add_column_if_missing(cur, table_name, column_name, column_type):
             cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
+def get_table_columns(cur, table_name):
+    if postgres_available():
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = %s
+            """,
+            (table_name,),
+        )
+        return {str(row[0]) for row in cur.fetchall()}
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return {str(row[1]) for row in cur.fetchall()}
+
+
+def ensure_founder_schema(cur):
+    """Bring older founding_members tables forward without dropping data.
+
+    Earlier payment-server deployments used a legacy founding_members table.
+    CREATE TABLE IF NOT EXISTS does not modify an existing table, so V10.25
+    must explicitly add the columns it now queries before founder/access-code
+    validation can be used by the cloud customer-history endpoints.
+    """
+    if postgres_available():
+        required_columns = [
+            ("founder_code", "TEXT DEFAULT ''"),
+            ("email", "TEXT DEFAULT ''"),
+            ("membership_type", "TEXT DEFAULT 'Founding Member'"),
+            ("active", "BOOLEAN DEFAULT TRUE"),
+            ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
+            ("expires_at", "TIMESTAMPTZ"),
+            ("notes", "TEXT DEFAULT ''"),
+            ("last_validated_at", "TIMESTAMPTZ"),
+            ("validation_count", "INTEGER DEFAULT 0"),
+        ]
+        for column_name, column_type in required_columns:
+            add_column_if_missing(cur, "founding_members", column_name, column_type)
+
+        columns = get_table_columns(cur, "founding_members")
+        for legacy_column in ["code", "access_code", "passcode", "owner_code", "founder_passcode"]:
+            if legacy_column in columns and legacy_column != "founder_code":
+                cur.execute(
+                    f"""
+                    UPDATE founding_members
+                    SET founder_code = UPPER(COALESCE(NULLIF(founder_code, ''), {legacy_column}))
+                    WHERE COALESCE(founder_code, '') = ''
+                      AND COALESCE({legacy_column}, '') != ''
+                    """
+                )
+        cur.execute(
+            """
+            UPDATE founding_members
+            SET expires_at = NOW() + INTERVAL '10 years'
+            WHERE expires_at IS NULL
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_founding_members_founder_code_nonblank
+            ON founding_members (founder_code)
+            WHERE founder_code IS NOT NULL AND founder_code <> ''
+            """
+        )
+        return
+
+    required_columns = [
+        ("founder_code", "TEXT DEFAULT ''"),
+        ("email", "TEXT DEFAULT ''"),
+        ("membership_type", "TEXT DEFAULT 'Founding Member'"),
+        ("active", "INTEGER DEFAULT 1"),
+        ("created_at", "TEXT"),
+        ("expires_at", "TEXT"),
+        ("notes", "TEXT DEFAULT ''"),
+        ("last_validated_at", "TEXT"),
+        ("validation_count", "INTEGER DEFAULT 0"),
+    ]
+    for column_name, column_type in required_columns:
+        add_column_if_missing(cur, "founding_members", column_name, column_type)
+
+    columns = get_table_columns(cur, "founding_members")
+    for legacy_column in ["code", "access_code", "passcode", "owner_code", "founder_passcode"]:
+        if legacy_column in columns and legacy_column != "founder_code":
+            cur.execute(
+                f"""
+                UPDATE founding_members
+                SET founder_code = UPPER(COALESCE(NULLIF(founder_code, ''), {legacy_column}))
+                WHERE COALESCE(founder_code, '') = ''
+                  AND COALESCE({legacy_column}, '') != ''
+                """
+            )
+    cur.execute(
+        """
+        UPDATE founding_members
+        SET expires_at = ?
+        WHERE COALESCE(expires_at, '') = ''
+        """,
+        ((utc_now() + timedelta(days=3650)).isoformat(),),
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_founding_members_founder_code_nonblank ON founding_members (founder_code) WHERE founder_code IS NOT NULL AND founder_code <> ''"
+    )
+
+
 def init_db():
     if postgres_available():
         conn = get_db_connection()
@@ -165,6 +268,8 @@ def init_db():
                     )
                     """
                 )
+
+                ensure_founder_schema(cur)
 
                 cur.execute(
                     """
@@ -371,6 +476,8 @@ def init_db():
             )
             """
         )
+
+        ensure_founder_schema(cur)
 
         cur.execute(
             """
