@@ -20,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.25.2-founder-code-upsert-fix"
+APP_VERSION = "V10.25.3-founder-code-hash-fix"
 
 app = Flask(__name__)
 
@@ -50,6 +50,11 @@ def normalize_email(value):
 
 def normalize_code(value):
     return str(value or "").strip().upper()
+
+
+def founder_code_hash(value):
+    """Return the legacy code_hash value expected by older production schemas."""
+    return hashlib.sha256(normalize_code(value).encode("utf-8")).hexdigest()
 
 
 def safe_bool(value):
@@ -149,6 +154,7 @@ def ensure_founder_schema(cur):
     if postgres_available():
         required_columns = [
             ("founder_code", "TEXT DEFAULT ''"),
+            ("code_hash", "TEXT DEFAULT ''"),
             ("email", "TEXT DEFAULT ''"),
             ("membership_type", "TEXT DEFAULT 'Founding Member'"),
             ("active", "BOOLEAN DEFAULT TRUE"),
@@ -190,6 +196,7 @@ def ensure_founder_schema(cur):
 
     required_columns = [
         ("founder_code", "TEXT DEFAULT ''"),
+        ("code_hash", "TEXT DEFAULT ''"),
         ("email", "TEXT DEFAULT ''"),
         ("membership_type", "TEXT DEFAULT 'Founding Member'"),
         ("active", "INTEGER DEFAULT 1"),
@@ -933,6 +940,7 @@ def create_or_update_founder_code(founder_code, email, expires_at, notes="", act
     notes = str(notes or "").strip()
     membership_type = str(membership_type or "Founding Member").strip()
     active_value = bool(active)
+    code_hash_value = founder_code_hash(founder_code)
 
     if postgres_available():
         conn = get_db_connection()
@@ -951,20 +959,21 @@ def create_or_update_founder_code(founder_code, email, expires_at, notes="", act
                             membership_type = %s,
                             active = %s,
                             expires_at = %s,
-                            notes = %s
+                            notes = %s,
+                            code_hash = %s
                         WHERE founder_code = %s
                         """,
-                        (email, membership_type, active_value, expires_at, notes, founder_code),
+                        (email, membership_type, active_value, expires_at, notes, code_hash_value, founder_code),
                     )
                 else:
                     cur.execute(
                         """
                         INSERT INTO founding_members (
-                            founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
+                            founder_code, code_hash, email, membership_type, active, created_at, expires_at, notes, validation_count
                         )
-                        VALUES (%s, %s, %s, %s, NOW(), %s, %s, 0)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, 0)
                         """,
-                        (founder_code, email, membership_type, active_value, expires_at, notes),
+                        (founder_code, code_hash_value, email, membership_type, active_value, expires_at, notes),
                     )
             conn.commit()
         finally:
@@ -986,20 +995,21 @@ def create_or_update_founder_code(founder_code, email, expires_at, notes="", act
                     membership_type = ?,
                     active = ?,
                     expires_at = ?,
-                    notes = ?
+                    notes = ?,
+                    code_hash = ?
                 WHERE founder_code = ?
                 """,
-                (email, membership_type, 1 if active_value else 0, expires_at, notes, founder_code),
+                (email, membership_type, 1 if active_value else 0, expires_at, notes, code_hash_value, founder_code),
             )
         else:
             cur.execute(
                 """
                 INSERT INTO founding_members (
-                    founder_code, email, membership_type, active, created_at, expires_at, notes, validation_count
+                    founder_code, code_hash, email, membership_type, active, created_at, expires_at, notes, validation_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
-                (founder_code, email, membership_type, 1 if active_value else 0, utc_now_iso(), expires_at, notes),
+                (founder_code, code_hash_value, email, membership_type, 1 if active_value else 0, utc_now_iso(), expires_at, notes),
             )
         conn.commit()
     finally:
