@@ -20,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.25.3-founder-code-hash-fix"
+APP_VERSION = "V10.26.0-cloud-refund-lifecycle-and-no-silent-sqlite"
 
 app = Flask(__name__)
 
@@ -31,6 +31,7 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()
 SUCCESS_URL = os.environ.get("SUCCESS_URL", "").strip()
 CANCEL_URL = os.environ.get("CANCEL_URL", "").strip()
 FOUNDER_ADMIN_TOKEN = os.environ.get("FOUNDER_ADMIN_TOKEN", "").strip()
+ALLOW_SQLITE_FALLBACK = os.environ.get("SHIPTAXREFUND_ALLOW_SQLITE_FALLBACK", "").strip()
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -68,6 +69,16 @@ def postgres_available():
     return bool(DATABASE_URL and psycopg2 is not None)
 
 
+def sqlite_fallback_allowed():
+    """Allow local SQLite only for explicit developer testing.
+
+    Production/customer deployments must use DATABASE_URL so payment, customer,
+    submission-history, refund-lifecycle, and refunds-received records are stored
+    in the hosted database instead of silently landing in a local sqlite file.
+    """
+    return safe_bool(ALLOW_SQLITE_FALLBACK)
+
+
 def get_base_url():
     if PUBLIC_BASE_URL:
         return PUBLIC_BASE_URL.rstrip("/") + "/"
@@ -96,7 +107,13 @@ def get_sqlite_path():
 def get_db_connection():
     if postgres_available():
         return psycopg2.connect(DATABASE_URL, sslmode="require")
-    return sqlite3.connect(get_sqlite_path())
+    if sqlite_fallback_allowed():
+        return sqlite3.connect(get_sqlite_path())
+    raise RuntimeError(
+        "DATABASE_URL is required. Local SQLite fallback is disabled by default "
+        "so customer/payment/refund history cannot be stored locally by accident. "
+        "Set SHIPTAXREFUND_ALLOW_SQLITE_FALLBACK=1 only for developer testing."
+    )
 
 
 def postgres_column_exists(cur, table_name, column_name):
@@ -391,6 +408,76 @@ def init_db():
                     """
                 )
 
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS customer_refund_lifecycle (
+                        lifecycle_id TEXT PRIMARY KEY,
+                        customer_uuid TEXT NOT NULL,
+                        forwarder TEXT DEFAULT '',
+                        profile_key TEXT DEFAULT '',
+                        amazon_account_email TEXT DEFAULT '',
+                        submission_id TEXT DEFAULT '',
+                        amazon_order_id TEXT DEFAULT '',
+                        current_status TEXT DEFAULT '',
+                        requested_tax_amount TEXT DEFAULT '',
+                        refund_amount_received TEXT DEFAULT '',
+                        refund_received_date TEXT DEFAULT '',
+                        refund_method TEXT DEFAULT '',
+                        action_needed TEXT DEFAULT '',
+                        status_detail TEXT DEFAULT '',
+                        tracker_payload TEXT DEFAULT '',
+                        source_run_id TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_refund_lifecycle_customer_forwarder ON customer_refund_lifecycle (customer_uuid, forwarder)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_refund_lifecycle_order ON customer_refund_lifecycle (amazon_order_id)"
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_refund_lifecycle_unique ON customer_refund_lifecycle (customer_uuid, forwarder, profile_key, submission_id, amazon_order_id)"
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS customer_refunds_received (
+                        refund_id TEXT PRIMARY KEY,
+                        customer_uuid TEXT NOT NULL,
+                        amazon_account_email TEXT DEFAULT '',
+                        amazon_order_id TEXT DEFAULT '',
+                        refund_amount_received TEXT DEFAULT '',
+                        refund_method TEXT DEFAULT '',
+                        refund_received_date TEXT DEFAULT '',
+                        email_date TEXT DEFAULT '',
+                        email_from TEXT DEFAULT '',
+                        email_to TEXT DEFAULT '',
+                        email_subject TEXT DEFAULT '',
+                        parsed_status TEXT DEFAULT '',
+                        source TEXT DEFAULT '',
+                        source_hash TEXT DEFAULT '',
+                        notes TEXT DEFAULT '',
+                        text_preview TEXT DEFAULT '',
+                        raw_payload TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_refunds_received_customer ON customer_refunds_received (customer_uuid)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_refunds_received_order ON customer_refunds_received (amazon_order_id)"
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_refunds_received_unique ON customer_refunds_received (customer_uuid, amazon_account_email, amazon_order_id, refund_amount_received, source_hash)"
+                )
+
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS customer_claimant_profiles (
@@ -598,6 +685,64 @@ def init_db():
             )
             """
         )
+
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_refund_lifecycle (
+                lifecycle_id TEXT PRIMARY KEY,
+                customer_uuid TEXT NOT NULL,
+                forwarder TEXT DEFAULT '',
+                profile_key TEXT DEFAULT '',
+                amazon_account_email TEXT DEFAULT '',
+                submission_id TEXT DEFAULT '',
+                amazon_order_id TEXT DEFAULT '',
+                current_status TEXT DEFAULT '',
+                requested_tax_amount TEXT DEFAULT '',
+                refund_amount_received TEXT DEFAULT '',
+                refund_received_date TEXT DEFAULT '',
+                refund_method TEXT DEFAULT '',
+                action_needed TEXT DEFAULT '',
+                status_detail TEXT DEFAULT '',
+                tracker_payload TEXT DEFAULT '',
+                source_run_id TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_refund_lifecycle_customer_forwarder ON customer_refund_lifecycle (customer_uuid, forwarder)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_refund_lifecycle_order ON customer_refund_lifecycle (amazon_order_id)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_refund_lifecycle_unique ON customer_refund_lifecycle (customer_uuid, forwarder, profile_key, submission_id, amazon_order_id)")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_refunds_received (
+                refund_id TEXT PRIMARY KEY,
+                customer_uuid TEXT NOT NULL,
+                amazon_account_email TEXT DEFAULT '',
+                amazon_order_id TEXT DEFAULT '',
+                refund_amount_received TEXT DEFAULT '',
+                refund_method TEXT DEFAULT '',
+                refund_received_date TEXT DEFAULT '',
+                email_date TEXT DEFAULT '',
+                email_from TEXT DEFAULT '',
+                email_to TEXT DEFAULT '',
+                email_subject TEXT DEFAULT '',
+                parsed_status TEXT DEFAULT '',
+                source TEXT DEFAULT '',
+                source_hash TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                text_preview TEXT DEFAULT '',
+                raw_payload TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_refunds_received_customer ON customer_refunds_received (customer_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_refunds_received_order ON customer_refunds_received (amazon_order_id)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_refunds_received_unique ON customer_refunds_received (customer_uuid, amazon_account_email, amazon_order_id, refund_amount_received, source_hash)")
 
         cur.execute(
             """
@@ -1523,6 +1668,355 @@ def record_customer_run(payload, customer_uuid):
     return run_id
 
 
+
+
+def _record_value(record, *keys):
+    for key in keys:
+        if key in record and record.get(key) not in (None, ""):
+            return str(record.get(key, "") or "").strip()
+    return ""
+
+
+def _json_payload(record):
+    try:
+        return json.dumps(record, sort_keys=True, default=str)
+    except Exception:
+        return str(record)
+
+
+def normalize_refund_lifecycle_record(record, customer_uuid, forwarder_default="", source_run_id=""):
+    record = record if isinstance(record, dict) else {}
+    forwarder = _record_value(record, "forwarder", "Forwarder") or forwarder_default
+    forwarder = str(forwarder or "").strip().lower()
+    profile_key = _record_value(record, "profile_key", "Profile Key", "Customer Profile Key")
+    amazon_account_email = normalize_email(_record_value(record, "amazon_account_email", "Amazon Account Email"))
+    submission_id = _record_value(record, "submission_id", "Submission ID", "certification_id")
+    amazon_order_id = _record_value(record, "amazon_order_id", "Amazon Order ID", "order_id")
+    if not amazon_order_id:
+        return None
+    lifecycle_id = _record_value(record, "lifecycle_id", "Lifecycle ID")
+    if not lifecycle_id:
+        digest_source = "|".join([customer_uuid, forwarder, profile_key, submission_id, amazon_order_id])
+        lifecycle_id = "lifecycle_" + hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:32]
+    return {
+        "lifecycle_id": lifecycle_id,
+        "customer_uuid": customer_uuid,
+        "forwarder": forwarder,
+        "profile_key": profile_key,
+        "amazon_account_email": amazon_account_email,
+        "submission_id": submission_id,
+        "amazon_order_id": amazon_order_id,
+        "current_status": _record_value(record, "current_status", "Current Status"),
+        "requested_tax_amount": _record_value(record, "requested_tax_amount", "Requested Tax Amount"),
+        "refund_amount_received": _record_value(record, "refund_amount_received", "Refund Amount Received"),
+        "refund_received_date": _record_value(record, "refund_received_date", "Refund Received Date"),
+        "refund_method": _record_value(record, "refund_method", "Refund Method"),
+        "action_needed": _record_value(record, "action_needed", "Action Needed"),
+        "status_detail": _record_value(record, "status_detail", "Status Detail"),
+        "tracker_payload": _json_payload(record),
+        "source_run_id": _record_value(record, "source_run_id") or source_run_id,
+    }
+
+
+def upsert_customer_refund_lifecycle(customer_uuid, records, forwarder="", source_run_id=""):
+    init_db()
+    customer_uuid = str(customer_uuid or "").strip()
+    if not customer_uuid:
+        raise ValueError("customer_uuid is required.")
+    if not isinstance(records, list):
+        raise ValueError("records must be a list.")
+
+    normalized_records = []
+    for record in records:
+        normalized = normalize_refund_lifecycle_record(record, customer_uuid, forwarder, source_run_id)
+        if normalized:
+            normalized_records.append(normalized)
+
+    if not normalized_records:
+        return 0
+
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                for row in normalized_records:
+                    cur.execute(
+                        """
+                        INSERT INTO customer_refund_lifecycle (
+                            lifecycle_id, customer_uuid, forwarder, profile_key, amazon_account_email,
+                            submission_id, amazon_order_id, current_status, requested_tax_amount,
+                            refund_amount_received, refund_received_date, refund_method, action_needed,
+                            status_detail, tracker_payload, source_run_id, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (customer_uuid, forwarder, profile_key, submission_id, amazon_order_id)
+                        DO UPDATE SET
+                            current_status = COALESCE(NULLIF(EXCLUDED.current_status, ''), customer_refund_lifecycle.current_status),
+                            requested_tax_amount = COALESCE(NULLIF(EXCLUDED.requested_tax_amount, ''), customer_refund_lifecycle.requested_tax_amount),
+                            refund_amount_received = COALESCE(NULLIF(EXCLUDED.refund_amount_received, ''), customer_refund_lifecycle.refund_amount_received),
+                            refund_received_date = COALESCE(NULLIF(EXCLUDED.refund_received_date, ''), customer_refund_lifecycle.refund_received_date),
+                            refund_method = COALESCE(NULLIF(EXCLUDED.refund_method, ''), customer_refund_lifecycle.refund_method),
+                            action_needed = COALESCE(NULLIF(EXCLUDED.action_needed, ''), customer_refund_lifecycle.action_needed),
+                            status_detail = COALESCE(NULLIF(EXCLUDED.status_detail, ''), customer_refund_lifecycle.status_detail),
+                            tracker_payload = EXCLUDED.tracker_payload,
+                            source_run_id = COALESCE(NULLIF(EXCLUDED.source_run_id, ''), customer_refund_lifecycle.source_run_id),
+                            updated_at = NOW()
+                        """,
+                        (
+                            row["lifecycle_id"], row["customer_uuid"], row["forwarder"], row["profile_key"],
+                            row["amazon_account_email"], row["submission_id"], row["amazon_order_id"],
+                            row["current_status"], row["requested_tax_amount"], row["refund_amount_received"],
+                            row["refund_received_date"], row["refund_method"], row["action_needed"],
+                            row["status_detail"], row["tracker_payload"], row["source_run_id"],
+                        ),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        return len(normalized_records)
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        now = utc_now_iso()
+        for row in normalized_records:
+            cur.execute(
+                """
+                INSERT INTO customer_refund_lifecycle (
+                    lifecycle_id, customer_uuid, forwarder, profile_key, amazon_account_email,
+                    submission_id, amazon_order_id, current_status, requested_tax_amount,
+                    refund_amount_received, refund_received_date, refund_method, action_needed,
+                    status_detail, tracker_payload, source_run_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(customer_uuid, forwarder, profile_key, submission_id, amazon_order_id)
+                DO UPDATE SET
+                    current_status = CASE WHEN excluded.current_status != '' THEN excluded.current_status ELSE current_status END,
+                    requested_tax_amount = CASE WHEN excluded.requested_tax_amount != '' THEN excluded.requested_tax_amount ELSE requested_tax_amount END,
+                    refund_amount_received = CASE WHEN excluded.refund_amount_received != '' THEN excluded.refund_amount_received ELSE refund_amount_received END,
+                    refund_received_date = CASE WHEN excluded.refund_received_date != '' THEN excluded.refund_received_date ELSE refund_received_date END,
+                    refund_method = CASE WHEN excluded.refund_method != '' THEN excluded.refund_method ELSE refund_method END,
+                    action_needed = CASE WHEN excluded.action_needed != '' THEN excluded.action_needed ELSE action_needed END,
+                    status_detail = CASE WHEN excluded.status_detail != '' THEN excluded.status_detail ELSE status_detail END,
+                    tracker_payload = excluded.tracker_payload,
+                    source_run_id = CASE WHEN excluded.source_run_id != '' THEN excluded.source_run_id ELSE source_run_id END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    row["lifecycle_id"], row["customer_uuid"], row["forwarder"], row["profile_key"],
+                    row["amazon_account_email"], row["submission_id"], row["amazon_order_id"],
+                    row["current_status"], row["requested_tax_amount"], row["refund_amount_received"],
+                    row["refund_received_date"], row["refund_method"], row["action_needed"],
+                    row["status_detail"], row["tracker_payload"], row["source_run_id"], now, now,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(normalized_records)
+
+
+def get_customer_refund_lifecycle(customer_uuid, forwarder="", profile_key="", amazon_account_email=""):
+    init_db()
+    customer_uuid = str(customer_uuid or "").strip()
+    forwarder = str(forwarder or "").strip().lower()
+    profile_key = str(profile_key or "").strip()
+    amazon_account_email = normalize_email(amazon_account_email)
+
+    clauses = ["customer_uuid = %s" if postgres_available() else "customer_uuid = ?"]
+    params = [customer_uuid]
+    if forwarder:
+        clauses.append("LOWER(forwarder) = %s" if postgres_available() else "LOWER(forwarder) = ?")
+        params.append(forwarder)
+    if profile_key:
+        clauses.append("profile_key = %s" if postgres_available() else "profile_key = ?")
+        params.append(profile_key)
+    if amazon_account_email:
+        clauses.append("LOWER(amazon_account_email) = %s" if postgres_available() else "LOWER(amazon_account_email) = ?")
+        params.append(amazon_account_email)
+    sql = "SELECT * FROM customer_refund_lifecycle WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC"
+
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, tuple(params))
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    conn = get_db_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        return [dict(row) for row in cur.execute(sql, tuple(params)).fetchall()]
+    finally:
+        conn.close()
+
+
+def normalize_refunds_received_record(record, customer_uuid):
+    record = record if isinstance(record, dict) else {}
+    amazon_account_email = normalize_email(_record_value(record, "amazon_account_email", "Amazon Account Email"))
+    amazon_order_id = _record_value(record, "amazon_order_id", "Amazon Order ID", "order_id")
+    refund_amount_received = _record_value(record, "refund_amount_received", "Refund Amount Received", "refund_amount")
+    source_hash = _record_value(record, "source_hash", "Source Hash")
+    if not amazon_order_id:
+        return None
+    refund_id = _record_value(record, "refund_id", "Refund ID")
+    if not refund_id:
+        digest_source = "|".join([customer_uuid, amazon_account_email, amazon_order_id, refund_amount_received, source_hash])
+        refund_id = "refund_" + hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:32]
+    return {
+        "refund_id": refund_id,
+        "customer_uuid": customer_uuid,
+        "amazon_account_email": amazon_account_email,
+        "amazon_order_id": amazon_order_id,
+        "refund_amount_received": refund_amount_received,
+        "refund_method": _record_value(record, "refund_method", "Refund Method"),
+        "refund_received_date": _record_value(record, "refund_received_date", "Refund Received Date"),
+        "email_date": _record_value(record, "email_date", "Email Date"),
+        "email_from": _record_value(record, "email_from", "Email From", "from"),
+        "email_to": _record_value(record, "email_to", "Email To", "to"),
+        "email_subject": _record_value(record, "email_subject", "Email Subject", "subject"),
+        "parsed_status": _record_value(record, "parsed_status", "Parsed Status"),
+        "source": _record_value(record, "source", "Source"),
+        "source_hash": source_hash,
+        "notes": _record_value(record, "notes", "Notes"),
+        "text_preview": _record_value(record, "text_preview", "Text Preview"),
+        "raw_payload": _json_payload(record),
+    }
+
+
+def upsert_customer_refunds_received(customer_uuid, records):
+    init_db()
+    customer_uuid = str(customer_uuid or "").strip()
+    if not customer_uuid:
+        raise ValueError("customer_uuid is required.")
+    if not isinstance(records, list):
+        raise ValueError("records must be a list.")
+
+    normalized_records = []
+    for record in records:
+        normalized = normalize_refunds_received_record(record, customer_uuid)
+        if normalized:
+            normalized_records.append(normalized)
+
+    if not normalized_records:
+        return 0
+
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                for row in normalized_records:
+                    cur.execute(
+                        """
+                        INSERT INTO customer_refunds_received (
+                            refund_id, customer_uuid, amazon_account_email, amazon_order_id,
+                            refund_amount_received, refund_method, refund_received_date, email_date,
+                            email_from, email_to, email_subject, parsed_status, source, source_hash,
+                            notes, text_preview, raw_payload, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (customer_uuid, amazon_account_email, amazon_order_id, refund_amount_received, source_hash)
+                        DO UPDATE SET
+                            refund_method = COALESCE(NULLIF(EXCLUDED.refund_method, ''), customer_refunds_received.refund_method),
+                            refund_received_date = COALESCE(NULLIF(EXCLUDED.refund_received_date, ''), customer_refunds_received.refund_received_date),
+                            email_date = COALESCE(NULLIF(EXCLUDED.email_date, ''), customer_refunds_received.email_date),
+                            email_from = COALESCE(NULLIF(EXCLUDED.email_from, ''), customer_refunds_received.email_from),
+                            email_to = COALESCE(NULLIF(EXCLUDED.email_to, ''), customer_refunds_received.email_to),
+                            email_subject = COALESCE(NULLIF(EXCLUDED.email_subject, ''), customer_refunds_received.email_subject),
+                            parsed_status = COALESCE(NULLIF(EXCLUDED.parsed_status, ''), customer_refunds_received.parsed_status),
+                            source = COALESCE(NULLIF(EXCLUDED.source, ''), customer_refunds_received.source),
+                            notes = COALESCE(NULLIF(EXCLUDED.notes, ''), customer_refunds_received.notes),
+                            text_preview = COALESCE(NULLIF(EXCLUDED.text_preview, ''), customer_refunds_received.text_preview),
+                            raw_payload = EXCLUDED.raw_payload,
+                            updated_at = NOW()
+                        """,
+                        (
+                            row["refund_id"], row["customer_uuid"], row["amazon_account_email"], row["amazon_order_id"],
+                            row["refund_amount_received"], row["refund_method"], row["refund_received_date"], row["email_date"],
+                            row["email_from"], row["email_to"], row["email_subject"], row["parsed_status"], row["source"],
+                            row["source_hash"], row["notes"], row["text_preview"], row["raw_payload"],
+                        ),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        return len(normalized_records)
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        now = utc_now_iso()
+        for row in normalized_records:
+            cur.execute(
+                """
+                INSERT INTO customer_refunds_received (
+                    refund_id, customer_uuid, amazon_account_email, amazon_order_id,
+                    refund_amount_received, refund_method, refund_received_date, email_date,
+                    email_from, email_to, email_subject, parsed_status, source, source_hash,
+                    notes, text_preview, raw_payload, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(customer_uuid, amazon_account_email, amazon_order_id, refund_amount_received, source_hash)
+                DO UPDATE SET
+                    refund_method = CASE WHEN excluded.refund_method != '' THEN excluded.refund_method ELSE refund_method END,
+                    refund_received_date = CASE WHEN excluded.refund_received_date != '' THEN excluded.refund_received_date ELSE refund_received_date END,
+                    email_date = CASE WHEN excluded.email_date != '' THEN excluded.email_date ELSE email_date END,
+                    email_from = CASE WHEN excluded.email_from != '' THEN excluded.email_from ELSE email_from END,
+                    email_to = CASE WHEN excluded.email_to != '' THEN excluded.email_to ELSE email_to END,
+                    email_subject = CASE WHEN excluded.email_subject != '' THEN excluded.email_subject ELSE email_subject END,
+                    parsed_status = CASE WHEN excluded.parsed_status != '' THEN excluded.parsed_status ELSE parsed_status END,
+                    source = CASE WHEN excluded.source != '' THEN excluded.source ELSE source END,
+                    notes = CASE WHEN excluded.notes != '' THEN excluded.notes ELSE notes END,
+                    text_preview = CASE WHEN excluded.text_preview != '' THEN excluded.text_preview ELSE text_preview END,
+                    raw_payload = excluded.raw_payload,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    row["refund_id"], row["customer_uuid"], row["amazon_account_email"], row["amazon_order_id"],
+                    row["refund_amount_received"], row["refund_method"], row["refund_received_date"], row["email_date"],
+                    row["email_from"], row["email_to"], row["email_subject"], row["parsed_status"], row["source"],
+                    row["source_hash"], row["notes"], row["text_preview"], row["raw_payload"], now, now,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(normalized_records)
+
+
+def get_customer_refunds_received(customer_uuid, amazon_account_email=""):
+    init_db()
+    customer_uuid = str(customer_uuid or "").strip()
+    amazon_account_email = normalize_email(amazon_account_email)
+
+    clauses = ["customer_uuid = %s" if postgres_available() else "customer_uuid = ?"]
+    params = [customer_uuid]
+    if amazon_account_email:
+        clauses.append("LOWER(amazon_account_email) = %s" if postgres_available() else "LOWER(amazon_account_email) = ?")
+        params.append(amazon_account_email)
+    sql = "SELECT * FROM customer_refunds_received WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC"
+
+    if postgres_available():
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, tuple(params))
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    conn = get_db_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        return [dict(row) for row in cur.execute(sql, tuple(params)).fetchall()]
+    finally:
+        conn.close()
+
+
 def normalize_identity_part(value):
     text = str(value or "").strip().lower()
     text = re_sub_non_alnum(text)
@@ -1909,10 +2403,13 @@ def index():
             "version": APP_VERSION,
             "stripe_configured": bool(STRIPE_SECRET_KEY),
             "database_configured": bool(DATABASE_URL),
+            "sqlite_fallback_allowed": sqlite_fallback_allowed(),
             "database_ready": db_ready,
             "webhook_secret_configured": bool(STRIPE_WEBHOOK_SECRET),
             "founder_admin_token_configured": bool(FOUNDER_ADMIN_TOKEN),
             "cloud_customer_history_enabled": True,
+            "cloud_refund_lifecycle_enabled": True,
+            "cloud_refunds_received_enabled": True,
         }
     )
 
@@ -2178,6 +2675,135 @@ def customer_history_sync():
                 "version": APP_VERSION,
             }
         )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+
+
+@app.route("/customer/refund-lifecycle", methods=["POST"])
+def customer_refund_lifecycle_list():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    ok, reason, email = validate_customer_access_payload(payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+
+    try:
+        customer = resolve_authorized_customer(payload, email)
+        rows = get_customer_refund_lifecycle(
+            customer.get("customer_uuid", ""),
+            forwarder=payload.get("forwarder", ""),
+            profile_key=payload.get("profile_key", ""),
+            amazon_account_email=payload.get("amazon_account_email", "") or payload.get("amazon_email", ""),
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", email),
+                "lifecycle": rows,
+                "lifecycle_count": len(rows),
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refund-lifecycle/sync", methods=["POST"])
+def customer_refund_lifecycle_sync():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    ok, reason, email = validate_customer_access_payload(payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+
+    try:
+        customer = resolve_authorized_customer(payload, email)
+        forwarder = str(payload.get("forwarder", "") or "").strip().lower()
+        source_run_id = str(payload.get("run_id", "") or "").strip()
+        records = payload.get("lifecycle", payload.get("records", []))
+        synced_count = upsert_customer_refund_lifecycle(customer.get("customer_uuid", ""), records, forwarder, source_run_id)
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", email),
+                "forwarder": forwarder,
+                "synced_count": synced_count,
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refunds-received", methods=["POST"])
+def customer_refunds_received_list():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    ok, reason, email = validate_customer_access_payload(payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+
+    try:
+        customer = resolve_authorized_customer(payload, email)
+        rows = get_customer_refunds_received(
+            customer.get("customer_uuid", ""),
+            amazon_account_email=payload.get("amazon_account_email", "") or payload.get("amazon_email", ""),
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", email),
+                "refunds_received": rows,
+                "refund_count": len(rows),
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refunds-received/sync", methods=["POST"])
+def customer_refunds_received_sync():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    ok, reason, email = validate_customer_access_payload(payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+
+    try:
+        customer = resolve_authorized_customer(payload, email)
+        records = payload.get("refunds_received", payload.get("records", []))
+        synced_count = upsert_customer_refunds_received(customer.get("customer_uuid", ""), records)
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", email),
+                "synced_count": synced_count,
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
 
