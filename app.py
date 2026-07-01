@@ -20,7 +20,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.26.0-cloud-refund-lifecycle-and-no-silent-sqlite"
+APP_VERSION = "V10.26.1-free-amazon-refund-tracker"
 
 app = Flask(__name__)
 
@@ -2678,6 +2678,178 @@ def customer_history_sync():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
 
+
+
+
+
+def refund_tracker_email_from_payload(payload):
+    """Return the Amazon refund email used to identify the free refund tracker.
+
+    The Refund Tracker is not a paid feature. It is keyed to the Amazon account
+    email where Amazon refund correspondence is received, not to a founder code
+    or Stripe payment session.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    email = normalize_email(
+        payload.get("amazon_refund_email", "")
+        or payload.get("amazon_account_email", "")
+        or payload.get("amazon_email", "")
+        or payload.get("email", "")
+    )
+    if not email or "@" not in email:
+        return ""
+    return email
+
+
+def resolve_free_refund_tracker_customer(payload):
+    """Create or return the free Refund Tracker cloud customer record."""
+    email = refund_tracker_email_from_payload(payload)
+    if not email:
+        raise PermissionError("Amazon refund email / Amazon account email is required.")
+    display_name = str(
+        payload.get("display_name", "")
+        or payload.get("customer_name", "")
+        or payload.get("claimant_name", "")
+        or ""
+    ).strip()
+    customer = get_or_create_customer(email, display_name=display_name, source="free_refund_tracker")
+    return customer, email
+
+
+def enrich_refund_tracker_records_with_email(records, amazon_refund_email):
+    """Attach the Amazon refund email to uploaded tracker/refund rows when missing."""
+    output = []
+    if not isinstance(records, list):
+        return output
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        row = dict(record)
+        if not normalize_email(row.get("amazon_account_email", "") or row.get("Amazon Account Email", "")):
+            row["amazon_account_email"] = amazon_refund_email
+        output.append(row)
+    return output
+
+
+@app.route("/customer/refund-tracker/lifecycle", methods=["POST"])
+def free_refund_tracker_lifecycle_list():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    try:
+        customer, amazon_refund_email = resolve_free_refund_tracker_customer(payload)
+        rows = get_customer_refund_lifecycle(
+            customer.get("customer_uuid", ""),
+            forwarder=payload.get("forwarder", ""),
+            profile_key=payload.get("profile_key", ""),
+            amazon_account_email=amazon_refund_email,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", amazon_refund_email),
+                "amazon_refund_email": amazon_refund_email,
+                "lifecycle": rows,
+                "lifecycle_count": len(rows),
+                "access_model": "free_refund_tracker_amazon_email",
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refund-tracker/lifecycle/sync", methods=["POST"])
+def free_refund_tracker_lifecycle_sync():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    try:
+        customer, amazon_refund_email = resolve_free_refund_tracker_customer(payload)
+        forwarder = str(payload.get("forwarder", "") or "").strip().lower()
+        source_run_id = str(payload.get("run_id", "") or "").strip()
+        records = payload.get("lifecycle", payload.get("records", []))
+        records = enrich_refund_tracker_records_with_email(records, amazon_refund_email)
+        synced_count = upsert_customer_refund_lifecycle(customer.get("customer_uuid", ""), records, forwarder, source_run_id)
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", amazon_refund_email),
+                "amazon_refund_email": amazon_refund_email,
+                "forwarder": forwarder,
+                "synced_count": synced_count,
+                "access_model": "free_refund_tracker_amazon_email",
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refund-tracker/refunds-received", methods=["POST"])
+def free_refund_tracker_refunds_received_list():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    try:
+        customer, amazon_refund_email = resolve_free_refund_tracker_customer(payload)
+        rows = get_customer_refunds_received(
+            customer.get("customer_uuid", ""),
+            amazon_account_email=amazon_refund_email,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", amazon_refund_email),
+                "amazon_refund_email": amazon_refund_email,
+                "refunds_received": rows,
+                "refund_count": len(rows),
+                "access_model": "free_refund_tracker_amazon_email",
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+
+
+@app.route("/customer/refund-tracker/refunds-received/sync", methods=["POST"])
+def free_refund_tracker_refunds_received_sync():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    try:
+        customer, amazon_refund_email = resolve_free_refund_tracker_customer(payload)
+        records = payload.get("refunds_received", payload.get("records", []))
+        records = enrich_refund_tracker_records_with_email(records, amazon_refund_email)
+        synced_count = upsert_customer_refunds_received(customer.get("customer_uuid", ""), records)
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", amazon_refund_email),
+                "amazon_refund_email": amazon_refund_email,
+                "synced_count": synced_count,
+                "access_model": "free_refund_tracker_amazon_email",
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
 
 
 
