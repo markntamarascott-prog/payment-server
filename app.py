@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ except Exception:
         pass
 
 
-APP_VERSION = "V10.26.1-free-amazon-refund-tracker"
+APP_VERSION = "V10.27.0-maxtracks-export-reference-cloud"
 
 app = Flask(__name__)
 
@@ -525,6 +526,53 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_customer_claimant_profile_events_profile ON customer_claimant_profile_events (profile_key)"
                 )
 
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS customer_export_references (
+                        reference_id TEXT PRIMARY KEY,
+                        customer_uuid TEXT NOT NULL,
+                        forwarder TEXT DEFAULT '',
+                        profile_key TEXT DEFAULT '',
+                        amazon_account_email TEXT DEFAULT '',
+                        max_shipping_account_number TEXT DEFAULT '',
+                        export_year TEXT DEFAULT '',
+                        amazon_tracking_number TEXT DEFAULT '',
+                        export_reference TEXT DEFAULT '',
+                        reference_source TEXT DEFAULT '',
+                        source_run_id TEXT DEFAULT '',
+                        raw_payload TEXT DEFAULT '',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_export_references_customer ON customer_export_references (customer_uuid)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_customer_export_references_tracking ON customer_export_references (amazon_tracking_number)"
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_export_references_tracking
+                    ON customer_export_references (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS customer_export_reference_sequences (
+                        customer_uuid TEXT NOT NULL,
+                        forwarder TEXT NOT NULL,
+                        profile_key TEXT NOT NULL,
+                        export_year TEXT NOT NULL,
+                        last_sequence_number INTEGER DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (customer_uuid, forwarder, profile_key, export_year)
+                    )
+                    """
+                )
+
             conn.commit()
         finally:
             conn.close()
@@ -782,6 +830,49 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_claimant_profiles_amazon_email ON customer_claimant_profiles (amazon_account_email)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_claimant_profiles_max_account ON customer_claimant_profiles (max_shipping_account_number)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_claimant_profile_events_profile ON customer_claimant_profile_events (profile_key)")
+
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_export_references (
+                reference_id TEXT PRIMARY KEY,
+                customer_uuid TEXT NOT NULL,
+                forwarder TEXT DEFAULT '',
+                profile_key TEXT DEFAULT '',
+                amazon_account_email TEXT DEFAULT '',
+                max_shipping_account_number TEXT DEFAULT '',
+                export_year TEXT DEFAULT '',
+                amazon_tracking_number TEXT DEFAULT '',
+                export_reference TEXT DEFAULT '',
+                reference_source TEXT DEFAULT '',
+                source_run_id TEXT DEFAULT '',
+                raw_payload TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_customer ON customer_export_references (customer_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_tracking ON customer_export_references (amazon_tracking_number)")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_export_references_tracking
+            ON customer_export_references (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_export_reference_sequences (
+                customer_uuid TEXT NOT NULL,
+                forwarder TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                export_year TEXT NOT NULL,
+                last_sequence_number INTEGER DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (customer_uuid, forwarder, profile_key, export_year)
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1854,6 +1945,351 @@ def get_customer_refund_lifecycle(customer_uuid, forwarder="", profile_key="", a
         conn.close()
 
 
+
+MAXTRACKS_REAL_REFERENCE_RE = re.compile(r"\b(\d{3,8})-(20\d{2})-MAXTRACKS\b", re.IGNORECASE)
+GENERATED_MAXTRACKS_REFERENCE_RE = re.compile(r"\bA(\d{4,8})-(20\d{2})-MAXTRACKS\b", re.IGNORECASE)
+
+
+def normalize_tracking_id(value):
+    text = str(value or "").strip().upper()
+    if text.startswith('="') and text.endswith('"'):
+        text = text[2:-1]
+    elif text.startswith("='") and text.endswith("'"):
+        text = text[2:-1]
+    return text.strip().strip("'").strip()
+
+
+def normalize_export_year(value):
+    text = str(value or "").strip()
+    match = re.search(r"\b(20\d{2}|19\d{2})\b", text)
+    if match:
+        return match.group(1)
+    return str(utc_now().year)
+
+
+def normalize_real_maxtracks_reference(value):
+    text = str(value or "").strip().upper().replace(" ", "")
+    match = MAXTRACKS_REAL_REFERENCE_RE.search(text)
+    if not match:
+        return ""
+    return f"{match.group(1)}-{match.group(2)}-MAXTRACKS"
+
+
+def normalize_generated_maxtracks_reference(value):
+    text = str(value or "").strip().upper().replace(" ", "")
+    match = GENERATED_MAXTRACKS_REFERENCE_RE.search(text)
+    if not match:
+        return ""
+    return f"A{int(match.group(1)):04d}-{match.group(2)}-MAXTRACKS"
+
+
+def format_generated_maxtracks_reference(sequence_number, export_year):
+    export_year = normalize_export_year(export_year)
+    return f"A{int(sequence_number):04d}-{export_year}-MAXTRACKS"
+
+
+def export_reference_id(customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number):
+    raw = "|".join([
+        str(customer_uuid or "").strip(),
+        str(forwarder or "").strip().lower(),
+        str(profile_key or "").strip(),
+        str(export_year or "").strip(),
+        normalize_tracking_id(amazon_tracking_number),
+    ])
+    return "export_ref_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _select_existing_export_reference(cur, customer_uuid, forwarder, profile_key, export_year, tracking):
+    sql = """
+        SELECT export_reference, reference_source
+        FROM customer_export_references
+        WHERE customer_uuid = %s
+          AND forwarder = %s
+          AND profile_key = %s
+          AND export_year = %s
+          AND amazon_tracking_number = %s
+        LIMIT 1
+    """ if postgres_available() else """
+        SELECT export_reference, reference_source
+        FROM customer_export_references
+        WHERE customer_uuid = ?
+          AND forwarder = ?
+          AND profile_key = ?
+          AND export_year = ?
+          AND amazon_tracking_number = ?
+        LIMIT 1
+    """
+    cur.execute(sql, (customer_uuid, forwarder, profile_key, export_year, tracking))
+    row = cur.fetchone()
+    if not row:
+        return "", ""
+    return str(row[0] or "").strip(), str(row[1] or "").strip()
+
+
+def _reserve_next_export_reference_pg(cur, customer_uuid, forwarder, profile_key, export_year):
+    cur.execute(
+        """
+        INSERT INTO customer_export_reference_sequences (
+            customer_uuid, forwarder, profile_key, export_year, last_sequence_number, updated_at
+        )
+        VALUES (%s, %s, %s, %s, 0, NOW())
+        ON CONFLICT (customer_uuid, forwarder, profile_key, export_year) DO NOTHING
+        """,
+        (customer_uuid, forwarder, profile_key, export_year),
+    )
+    cur.execute(
+        """
+        SELECT last_sequence_number
+        FROM customer_export_reference_sequences
+        WHERE customer_uuid = %s AND forwarder = %s AND profile_key = %s AND export_year = %s
+        FOR UPDATE
+        """,
+        (customer_uuid, forwarder, profile_key, export_year),
+    )
+    row = cur.fetchone()
+    next_number = int((row[0] if row else 0) or 0) + 1
+    cur.execute(
+        """
+        UPDATE customer_export_reference_sequences
+        SET last_sequence_number = %s, updated_at = NOW()
+        WHERE customer_uuid = %s AND forwarder = %s AND profile_key = %s AND export_year = %s
+        """,
+        (next_number, customer_uuid, forwarder, profile_key, export_year),
+    )
+    return format_generated_maxtracks_reference(next_number, export_year), next_number
+
+
+def _reserve_next_export_reference_sqlite(cur, customer_uuid, forwarder, profile_key, export_year):
+    now = utc_now_iso()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO customer_export_reference_sequences (
+            customer_uuid, forwarder, profile_key, export_year, last_sequence_number, updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, ?)
+        """,
+        (customer_uuid, forwarder, profile_key, export_year, now),
+    )
+    row = cur.execute(
+        """
+        SELECT last_sequence_number
+        FROM customer_export_reference_sequences
+        WHERE customer_uuid = ? AND forwarder = ? AND profile_key = ? AND export_year = ?
+        """,
+        (customer_uuid, forwarder, profile_key, export_year),
+    ).fetchone()
+    next_number = int((row[0] if row else 0) or 0) + 1
+    cur.execute(
+        """
+        UPDATE customer_export_reference_sequences
+        SET last_sequence_number = ?, updated_at = ?
+        WHERE customer_uuid = ? AND forwarder = ? AND profile_key = ? AND export_year = ?
+        """,
+        (next_number, now, customer_uuid, forwarder, profile_key, export_year),
+    )
+    return format_generated_maxtracks_reference(next_number, export_year), next_number
+
+
+def _upsert_export_reference(cur, row):
+    if postgres_available():
+        cur.execute(
+            """
+            INSERT INTO customer_export_references (
+                reference_id, customer_uuid, forwarder, profile_key, amazon_account_email,
+                max_shipping_account_number, export_year, amazon_tracking_number,
+                export_reference, reference_source, source_run_id, raw_payload, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)
+            DO UPDATE SET
+                amazon_account_email = COALESCE(NULLIF(EXCLUDED.amazon_account_email, ''), customer_export_references.amazon_account_email),
+                max_shipping_account_number = COALESCE(NULLIF(EXCLUDED.max_shipping_account_number, ''), customer_export_references.max_shipping_account_number),
+                export_reference = COALESCE(NULLIF(EXCLUDED.export_reference, ''), customer_export_references.export_reference),
+                reference_source = COALESCE(NULLIF(EXCLUDED.reference_source, ''), customer_export_references.reference_source),
+                source_run_id = COALESCE(NULLIF(EXCLUDED.source_run_id, ''), customer_export_references.source_run_id),
+                raw_payload = EXCLUDED.raw_payload,
+                updated_at = NOW()
+            """,
+            (
+                row["reference_id"], row["customer_uuid"], row["forwarder"], row["profile_key"],
+                row["amazon_account_email"], row["max_shipping_account_number"], row["export_year"],
+                row["amazon_tracking_number"], row["export_reference"], row["reference_source"],
+                row["source_run_id"], row["raw_payload"],
+            ),
+        )
+        return
+
+    now = utc_now_iso()
+    cur.execute(
+        """
+        INSERT INTO customer_export_references (
+            reference_id, customer_uuid, forwarder, profile_key, amazon_account_email,
+            max_shipping_account_number, export_year, amazon_tracking_number,
+            export_reference, reference_source, source_run_id, raw_payload, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)
+        DO UPDATE SET
+            amazon_account_email = CASE WHEN excluded.amazon_account_email != '' THEN excluded.amazon_account_email ELSE amazon_account_email END,
+            max_shipping_account_number = CASE WHEN excluded.max_shipping_account_number != '' THEN excluded.max_shipping_account_number ELSE max_shipping_account_number END,
+            export_reference = CASE WHEN excluded.export_reference != '' THEN excluded.export_reference ELSE export_reference END,
+            reference_source = CASE WHEN excluded.reference_source != '' THEN excluded.reference_source ELSE reference_source END,
+            source_run_id = CASE WHEN excluded.source_run_id != '' THEN excluded.source_run_id ELSE source_run_id END,
+            raw_payload = excluded.raw_payload,
+            updated_at = excluded.updated_at
+        """,
+        (
+            row["reference_id"], row["customer_uuid"], row["forwarder"], row["profile_key"],
+            row["amazon_account_email"], row["max_shipping_account_number"], row["export_year"],
+            row["amazon_tracking_number"], row["export_reference"], row["reference_source"],
+            row["source_run_id"], row["raw_payload"], now, now,
+        ),
+    )
+
+
+def resolve_customer_export_references(customer_uuid, records, amazon_account_email="", forwarder="max_shipping", profile_key="", max_shipping_account_number="", source_run_id=""):
+    init_db()
+    customer_uuid = str(customer_uuid or "").strip()
+    if not customer_uuid:
+        raise ValueError("customer_uuid is required.")
+    if not isinstance(records, list):
+        raise ValueError("records must be a list.")
+
+    forwarder = str(forwarder or "max_shipping").strip().lower() or "max_shipping"
+    profile_key = str(profile_key or "").strip()
+    amazon_account_email = normalize_email(amazon_account_email)
+    max_shipping_account_number = str(max_shipping_account_number or "").strip()
+    source_run_id = str(source_run_id or "").strip()
+
+    normalized_records = []
+    seen_keys = set()
+    for record in records:
+        record = record if isinstance(record, dict) else {}
+        tracking = normalize_tracking_id(
+            record.get("amazon_tracking_number", "")
+            or record.get("tracking_number", "")
+            or record.get("Amazon Tracking Number", "")
+        )
+        if not tracking:
+            continue
+        export_year = normalize_export_year(record.get("export_year", "") or record.get("Export Year", ""))
+        real_reference = normalize_real_maxtracks_reference(
+            record.get("real_export_reference", "")
+            or record.get("maxtracks_reference", "")
+            or record.get("export_reference", "")
+            or record.get("Export Reference", "")
+        )
+        key = (forwarder, profile_key, export_year, tracking)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized_records.append({
+            "tracking": tracking,
+            "export_year": export_year,
+            "real_reference": real_reference,
+            "raw_record": record,
+        })
+
+    if not normalized_records:
+        return []
+
+    results = []
+    conn = get_db_connection()
+    try:
+        if postgres_available():
+            with conn.cursor() as cur:
+                for item in normalized_records:
+                    tracking = item["tracking"]
+                    export_year = item["export_year"]
+                    real_reference = item["real_reference"]
+                    existing_reference, existing_source = _select_existing_export_reference(cur, customer_uuid, forwarder, profile_key, export_year, tracking)
+                    reused_existing = False
+                    sequence_number = None
+                    if real_reference:
+                        export_reference = real_reference
+                        reference_source = "real_maxtracks_reference"
+                    elif existing_reference:
+                        export_reference = existing_reference
+                        reference_source = existing_source or "generated_fallback_reference"
+                        reused_existing = True
+                    else:
+                        export_reference, sequence_number = _reserve_next_export_reference_pg(cur, customer_uuid, forwarder, profile_key, export_year)
+                        reference_source = "generated_fallback_reference"
+
+                    row = {
+                        "reference_id": export_reference_id(customer_uuid, forwarder, profile_key, export_year, tracking),
+                        "customer_uuid": customer_uuid,
+                        "forwarder": forwarder,
+                        "profile_key": profile_key,
+                        "amazon_account_email": amazon_account_email,
+                        "max_shipping_account_number": max_shipping_account_number,
+                        "export_year": export_year,
+                        "amazon_tracking_number": tracking,
+                        "export_reference": export_reference,
+                        "reference_source": reference_source,
+                        "source_run_id": source_run_id,
+                        "raw_payload": json.dumps(item["raw_record"], sort_keys=True),
+                    }
+                    _upsert_export_reference(cur, row)
+                    results.append({
+                        "amazon_tracking_number": tracking,
+                        "export_year": export_year,
+                        "export_reference": export_reference,
+                        "reference_source": reference_source,
+                        "reused_existing": reused_existing,
+                        "sequence_number": sequence_number,
+                    })
+            conn.commit()
+            return results
+
+        cur = conn.cursor()
+        for item in normalized_records:
+            tracking = item["tracking"]
+            export_year = item["export_year"]
+            real_reference = item["real_reference"]
+            existing_reference, existing_source = _select_existing_export_reference(cur, customer_uuid, forwarder, profile_key, export_year, tracking)
+            reused_existing = False
+            sequence_number = None
+            if real_reference:
+                export_reference = real_reference
+                reference_source = "real_maxtracks_reference"
+            elif existing_reference:
+                export_reference = existing_reference
+                reference_source = existing_source or "generated_fallback_reference"
+                reused_existing = True
+            else:
+                export_reference, sequence_number = _reserve_next_export_reference_sqlite(cur, customer_uuid, forwarder, profile_key, export_year)
+                reference_source = "generated_fallback_reference"
+
+            row = {
+                "reference_id": export_reference_id(customer_uuid, forwarder, profile_key, export_year, tracking),
+                "customer_uuid": customer_uuid,
+                "forwarder": forwarder,
+                "profile_key": profile_key,
+                "amazon_account_email": amazon_account_email,
+                "max_shipping_account_number": max_shipping_account_number,
+                "export_year": export_year,
+                "amazon_tracking_number": tracking,
+                "export_reference": export_reference,
+                "reference_source": reference_source,
+                "source_run_id": source_run_id,
+                "raw_payload": json.dumps(item["raw_record"], sort_keys=True),
+            }
+            _upsert_export_reference(cur, row)
+            results.append({
+                "amazon_tracking_number": tracking,
+                "export_year": export_year,
+                "export_reference": export_reference,
+                "reference_source": reference_source,
+                "reused_existing": reused_existing,
+                "sequence_number": sequence_number,
+            })
+        conn.commit()
+        return results
+    finally:
+        conn.close()
+
+
 def normalize_refunds_received_record(record, customer_uuid):
     record = record if isinstance(record, dict) else {}
     amazon_account_email = normalize_email(_record_value(record, "amazon_account_email", "Amazon Account Email"))
@@ -2410,6 +2846,7 @@ def index():
             "cloud_customer_history_enabled": True,
             "cloud_refund_lifecycle_enabled": True,
             "cloud_refunds_received_enabled": True,
+            "cloud_export_references_enabled": True,
         }
     )
 
@@ -2729,6 +3166,43 @@ def enrich_refund_tracker_records_with_email(records, amazon_refund_email):
             row["amazon_account_email"] = amazon_refund_email
         output.append(row)
     return output
+
+
+@app.route("/customer/export-references/resolve", methods=["POST"])
+def free_export_references_resolve():
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
+
+    try:
+        customer, amazon_refund_email = resolve_free_refund_tracker_customer(payload)
+        records = payload.get("records", [])
+        resolved = resolve_customer_export_references(
+            customer.get("customer_uuid", ""),
+            records,
+            amazon_account_email=amazon_refund_email,
+            forwarder=payload.get("forwarder", "max_shipping") or "max_shipping",
+            profile_key=payload.get("profile_key", ""),
+            max_shipping_account_number=payload.get("max_shipping_account_number", "") or payload.get("max_account_number", ""),
+            source_run_id=payload.get("run_id", "") or payload.get("source_run_id", ""),
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "customer_uuid": customer.get("customer_uuid", ""),
+                "email": customer.get("email", amazon_refund_email),
+                "amazon_refund_email": amazon_refund_email,
+                "forwarder": str(payload.get("forwarder", "max_shipping") or "max_shipping").strip().lower(),
+                "resolved_references": resolved,
+                "resolved_count": len(resolved),
+                "access_model": "free_refund_tracker_amazon_email",
+                "version": APP_VERSION,
+            }
+        )
+    except PermissionError as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
 
 
 @app.route("/customer/refund-tracker/lifecycle", methods=["POST"])
