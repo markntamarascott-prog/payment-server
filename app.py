@@ -21,7 +21,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.28.2-export-reference-resolver-fix"
+APP_VERSION = "V10.28.3-export-reference-bulk-resolver"
 
 app = Flask(__name__)
 
@@ -859,10 +859,11 @@ def _row_value(row, index=0, key=None, default=""):
 def resolve_customer_export_references(customer_uuid, records, amazon_account_email="", forwarder="max_shipping", profile_key="", max_shipping_account_number="", source_run_id=""):
     """Resolve Max export references in the hosted database.
 
-    V10.28.2 makes this endpoint safer for larger MaxTracks fallback batches by:
-    - using one atomic PostgreSQL UPSERT/RETURNING operation for fallback sequences,
-    - avoiding row-shape assumptions that can fail when cursor factories differ,
-    - returning JSON errors through the route instead of allowing Flask HTML 500 pages.
+    V10.28.3 bulk resolver fix:
+    - fetches existing references in one query instead of one query per tracking,
+    - reserves fallback reference sequences in year-sized blocks,
+    - bulk-upserts resolved references,
+    - avoids Render/Gunicorn request timeouts during large MaxTracks fallback batches.
     """
     init_db()
     customer_uuid = clean_text(customer_uuid)
@@ -892,7 +893,7 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
         if not tracking:
             continue
         year = normalize_export_year(record.get("export_year") or record.get("Export Year") or record.get("year"))
-        real = normalize_real_maxtracks_reference(
+        real_reference = normalize_real_maxtracks_reference(
             record.get("real_export_reference")
             or record.get("maxtracks_reference")
             or record.get("export_reference")
@@ -905,7 +906,7 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
         normalized.append({
             "tracking": tracking,
             "year": year,
-            "real_reference": real,
+            "real_reference": real_reference,
             "raw_record": record,
         })
 
@@ -913,56 +914,73 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
         return []
 
     conn = get_db_connection()
-    results = []
     try:
-        cur = conn.cursor()
-        ph = param()
+        if not postgres_available():
+            conn.row_factory = sqlite3.Row
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
+
+        trackings = sorted({item["tracking"] for item in normalized})
+        existing_map = {}
+        if trackings:
+            # Keep the query bounded. Current batches are small, but chunking makes the endpoint safe.
+            chunk_size = 500
+            for chunk_start in range(0, len(trackings), chunk_size):
+                chunk = trackings[chunk_start:chunk_start + chunk_size]
+                if postgres_available():
+                    cur.execute(
+                        """
+                        SELECT export_year, amazon_tracking_number, export_reference, reference_source
+                        FROM customer_export_references
+                        WHERE customer_uuid = %s
+                          AND forwarder = %s
+                          AND profile_key = %s
+                          AND amazon_tracking_number = ANY(%s)
+                        """,
+                        (customer_uuid, forwarder, profile_key, chunk),
+                    )
+                else:
+                    marks = ",".join(["?"] * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT export_year, amazon_tracking_number, export_reference, reference_source
+                        FROM customer_export_references
+                        WHERE customer_uuid = ?
+                          AND forwarder = ?
+                          AND profile_key = ?
+                          AND amazon_tracking_number IN ({marks})
+                        """,
+                        tuple([customer_uuid, forwarder, profile_key] + chunk),
+                    )
+                for row in cur.fetchall():
+                    if isinstance(row, dict):
+                        year = clean_text(row.get("export_year", ""))
+                        tracking = normalize_tracking_id(row.get("amazon_tracking_number", ""))
+                        export_reference = clean_text(row.get("export_reference", ""))
+                        reference_source = clean_text(row.get("reference_source", ""))
+                    else:
+                        year = clean_text(row[0])
+                        tracking = normalize_tracking_id(row[1])
+                        export_reference = clean_text(row[2])
+                        reference_source = clean_text(row[3])
+                    existing_map[(year, tracking)] = (export_reference, reference_source)
+
+        fallback_needing_sequence = []
         for item in normalized:
-            tracking = item["tracking"]
-            year = item["year"]
-            real_reference = item["real_reference"]
-            record = item["raw_record"]
+            key = (item["year"], item["tracking"])
+            if item["real_reference"]:
+                continue
+            if existing_map.get(key, ("", ""))[0]:
+                continue
+            fallback_needing_sequence.append(item)
 
-            if postgres_available():
-                cur.execute(
-                    """
-                    SELECT export_reference, reference_source
-                    FROM customer_export_references
-                    WHERE customer_uuid = %s
-                      AND forwarder = %s
-                      AND profile_key = %s
-                      AND export_year = %s
-                      AND amazon_tracking_number = %s
-                    LIMIT 1
-                    """,
-                    (customer_uuid, forwarder, profile_key, year, tracking),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT export_reference, reference_source
-                    FROM customer_export_references
-                    WHERE customer_uuid = ?
-                      AND forwarder = ?
-                      AND profile_key = ?
-                      AND export_year = ?
-                      AND amazon_tracking_number = ?
-                    LIMIT 1
-                    """,
-                    (customer_uuid, forwarder, profile_key, year, tracking),
-                )
-            existing = cur.fetchone()
+        sequence_assignments = {}
+        if fallback_needing_sequence:
+            by_year = {}
+            for item in fallback_needing_sequence:
+                by_year.setdefault(item["year"], []).append(item)
 
-            reused_existing = False
-            sequence_number = None
-            if real_reference:
-                export_reference = real_reference
-                reference_source = "real_maxtracks_reference"
-            elif existing:
-                export_reference = str(_row_value(existing, 0, "export_reference", "") or "").strip()
-                reference_source = str(_row_value(existing, 1, "reference_source", "") or "").strip() or "generated_fallback_reference"
-                reused_existing = True
-            else:
+            for year, items_for_year in by_year.items():
+                count_needed = len(items_for_year)
                 if postgres_available():
                     cur.execute(
                         """
@@ -970,16 +988,27 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                             customer_uuid, forwarder, profile_key, export_year,
                             last_sequence_number, updated_at
                         )
-                        VALUES (%s, %s, %s, %s, 1, NOW())
-                        ON CONFLICT (customer_uuid, forwarder, profile_key, export_year)
-                        DO UPDATE SET
-                            last_sequence_number = customer_export_reference_sequences.last_sequence_number + 1,
-                            updated_at = NOW()
-                        RETURNING last_sequence_number
+                        VALUES (%s, %s, %s, %s, 0, NOW())
+                        ON CONFLICT (customer_uuid, forwarder, profile_key, export_year) DO NOTHING
                         """,
                         (customer_uuid, forwarder, profile_key, year),
                     )
-                    sequence_number = int(_row_value(cur.fetchone(), 0, "last_sequence_number", 1) or 1)
+                    cur.execute(
+                        """
+                        UPDATE customer_export_reference_sequences
+                        SET last_sequence_number = last_sequence_number + %s,
+                            updated_at = NOW()
+                        WHERE customer_uuid = %s
+                          AND forwarder = %s
+                          AND profile_key = %s
+                          AND export_year = %s
+                        RETURNING last_sequence_number
+                        """,
+                        (count_needed, customer_uuid, forwarder, profile_key, year),
+                    )
+                    row = cur.fetchone()
+                    new_last = int(_row_value(row, 0, "last_sequence_number", count_needed) or count_needed)
+                    first_sequence = new_last - count_needed + 1
                 else:
                     now = utc_now_iso()
                     cur.execute(
@@ -1000,22 +1029,68 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                         """,
                         (customer_uuid, forwarder, profile_key, year),
                     )
-                    sequence_number = int(_row_value(cur.fetchone(), 0, "last_sequence_number", 0) or 0) + 1
+                    current = int(_row_value(cur.fetchone(), 0, "last_sequence_number", 0) or 0)
+                    first_sequence = current + 1
+                    new_last = current + count_needed
                     cur.execute(
                         """
                         UPDATE customer_export_reference_sequences
                         SET last_sequence_number = ?, updated_at = ?
                         WHERE customer_uuid = ? AND forwarder = ? AND profile_key = ? AND export_year = ?
                         """,
-                        (sequence_number, now, customer_uuid, forwarder, profile_key, year),
+                        (new_last, now, customer_uuid, forwarder, profile_key, year),
                     )
+
+                for offset, item in enumerate(items_for_year):
+                    sequence_number = first_sequence + offset
+                    sequence_assignments[(item["year"], item["tracking"])] = sequence_number
+
+        results = []
+        upsert_rows = []
+        for item in normalized:
+            tracking = item["tracking"]
+            year = item["year"]
+            key = (year, tracking)
+            real_reference = item["real_reference"]
+            existing_reference, existing_source = existing_map.get(key, ("", ""))
+            reused_existing = False
+            sequence_number = None
+
+            if real_reference:
+                export_reference = real_reference
+                reference_source = "real_maxtracks_reference"
+            elif existing_reference:
+                export_reference = existing_reference
+                reference_source = existing_source or "generated_fallback_reference"
+                reused_existing = True
+            else:
+                sequence_number = sequence_assignments.get(key)
+                if sequence_number is None:
+                    raise RuntimeError(f"No generated fallback sequence was reserved for tracking {tracking} / year {year}.")
                 export_reference = format_generated_maxtracks_reference(sequence_number, year)
                 reference_source = "generated_fallback_reference"
 
             reference_id = export_reference_id(customer_uuid, forwarder, profile_key, year, tracking)
-            raw_payload = json_text(record)
+            raw_payload = json_text(item["raw_record"])
+            upsert_rows.append((
+                reference_id, customer_uuid, forwarder, profile_key,
+                amazon_account_email, max_shipping_account_number, year,
+                tracking, export_reference, reference_source,
+                source_run_id, raw_payload,
+            ))
+            results.append({
+                "amazon_tracking_number": tracking,
+                "export_year": year,
+                "export_reference": export_reference,
+                "reference_source": reference_source,
+                "reused_existing": reused_existing,
+                "sequence_number": sequence_number,
+            })
+
+        if upsert_rows:
             if postgres_available():
-                cur.execute(
+                psycopg2.extras.execute_values(
+                    cur,
                     """
                     INSERT INTO customer_export_references (
                         reference_id, customer_uuid, forwarder, profile_key,
@@ -1023,7 +1098,7 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                         amazon_tracking_number, export_reference, reference_source,
                         source_run_id, raw_payload, created_at, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    VALUES %s
                     ON CONFLICT (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)
                     DO UPDATE SET
                         amazon_account_email = COALESCE(NULLIF(EXCLUDED.amazon_account_email, ''), customer_export_references.amazon_account_email),
@@ -1034,16 +1109,12 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                         raw_payload = EXCLUDED.raw_payload,
                         updated_at = NOW()
                     """,
-                    (
-                        reference_id, customer_uuid, forwarder, profile_key,
-                        amazon_account_email, max_shipping_account_number, year,
-                        tracking, export_reference, reference_source,
-                        source_run_id, raw_payload,
-                    ),
+                    upsert_rows,
+                    page_size=500,
                 )
             else:
                 now = utc_now_iso()
-                cur.execute(
+                cur.executemany(
                     """
                     INSERT INTO customer_export_references (
                         reference_id, customer_uuid, forwarder, profile_key,
@@ -1062,22 +1133,9 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                         raw_payload = excluded.raw_payload,
                         updated_at = excluded.updated_at
                     """,
-                    (
-                        reference_id, customer_uuid, forwarder, profile_key,
-                        amazon_account_email, max_shipping_account_number, year,
-                        tracking, export_reference, reference_source,
-                        source_run_id, raw_payload, now, now,
-                    ),
+                    [row + (now, now) for row in upsert_rows],
                 )
 
-            results.append({
-                "amazon_tracking_number": tracking,
-                "export_year": year,
-                "export_reference": export_reference,
-                "reference_source": reference_source,
-                "reused_existing": reused_existing,
-                "sequence_number": sequence_number,
-            })
         conn.commit()
         return results
     except Exception:
@@ -1088,7 +1146,6 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
         raise
     finally:
         conn.close()
-
 
 def normalize_refunds_received_record(record, customer_uuid):
     record = record if isinstance(record, dict) else {}
@@ -1303,7 +1360,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "admin_max_only_reset_enabled": True,
-        "export_reference_resolver_version": "V10.28.2",
+        "export_reference_resolver_version": "V10.28.3",
     })
 
 
@@ -1466,7 +1523,7 @@ def free_export_references_resolve():
             "resolved_references": resolved,
             "resolved_count": len(resolved),
             "access_model": "free_refund_tracker_amazon_email",
-            "resolver_version": "V10.28.2",
+            "resolver_version": "V10.28.3",
             "version": APP_VERSION,
         })
     except PermissionError as exc:
@@ -1480,7 +1537,7 @@ def free_export_references_resolve():
             "ok": False,
             "error": str(exc),
             "error_type": exc.__class__.__name__,
-            "resolver_version": "V10.28.2",
+            "resolver_version": "V10.28.3",
             "version": APP_VERSION,
         }), 500
 
