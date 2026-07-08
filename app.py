@@ -21,7 +21,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.28.3-export-reference-bulk-resolver"
+APP_VERSION = "V10.28.4-export-reference-bulk-upsert-fix"
 
 app = Flask(__name__)
 
@@ -859,10 +859,11 @@ def _row_value(row, index=0, key=None, default=""):
 def resolve_customer_export_references(customer_uuid, records, amazon_account_email="", forwarder="max_shipping", profile_key="", max_shipping_account_number="", source_run_id=""):
     """Resolve Max export references in the hosted database.
 
-    V10.28.3 bulk resolver fix:
+    V10.28.4 bulk upsert fix:
     - fetches existing references in one query instead of one query per tracking,
     - reserves fallback reference sequences in year-sized blocks,
     - bulk-upserts resolved references,
+    - fixes PostgreSQL execute_values column-count handling for created_at/updated_at,
     - avoids Render/Gunicorn request timeouts during large MaxTracks fallback batches.
     """
     init_db()
@@ -1110,6 +1111,7 @@ def resolve_customer_export_references(customer_uuid, records, amazon_account_em
                         updated_at = NOW()
                     """,
                     upsert_rows,
+                    template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
                     page_size=500,
                 )
             else:
@@ -1360,7 +1362,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "admin_max_only_reset_enabled": True,
-        "export_reference_resolver_version": "V10.28.3",
+        "export_reference_resolver_version": "V10.28.4",
     })
 
 
@@ -1523,7 +1525,7 @@ def free_export_references_resolve():
             "resolved_references": resolved,
             "resolved_count": len(resolved),
             "access_model": "free_refund_tracker_amazon_email",
-            "resolver_version": "V10.28.3",
+            "resolver_version": "V10.28.4",
             "version": APP_VERSION,
         })
     except PermissionError as exc:
@@ -1537,7 +1539,7 @@ def free_export_references_resolve():
             "ok": False,
             "error": str(exc),
             "error_type": exc.__class__.__name__,
-            "resolver_version": "V10.28.3",
+            "resolver_version": "V10.28.4",
             "version": APP_VERSION,
         }), 500
 
