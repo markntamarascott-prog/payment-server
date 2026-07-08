@@ -20,7 +20,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.28.0-admin-max-only-cloud-reset"
+APP_VERSION = "V10.28.1-admin-max-only-cloud-reset"
 
 app = Flask(__name__)
 
@@ -1435,11 +1435,18 @@ def customer_claimant_profiles_list():
 MAX_ONLY_RESET_CONFIRM_PHRASE = "RESET MAX ONLY KEEP NAVIVAN"
 
 
+def max_only_reset_navivan_like_pattern():
+    # psycopg2 treats percent signs in SQL text as placeholder markers.
+    # Literal LIKE wildcards therefore must be doubled for PostgreSQL, but not for SQLite.
+    return "NVR-%%" if postgres_available() else "NVR-%"
+
+
 def max_only_reset_specs(customer_uuid):
     ph = param()
+    nvr_like = max_only_reset_navivan_like_pattern()
     return [
-        {"table": "customer_refund_lifecycle", "pk": "lifecycle_id", "where": f"customer_uuid = {ph} AND NOT (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(submission_id,'') LIKE 'NVR-%')", "args": [customer_uuid], "purpose": "Remove active non-Navivan lifecycle rows, including old Max submitted/follow-up tracker rows."},
-        {"table": "customer_submission_history", "pk": "history_id", "where": f"customer_uuid = {ph} AND NOT (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(certification_id,'') LIKE 'NVR-%')", "args": [customer_uuid], "purpose": "Remove old Max cloud submission history while keeping Navivan history."},
+        {"table": "customer_refund_lifecycle", "pk": "lifecycle_id", "where": f"customer_uuid = {ph} AND NOT (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(submission_id,'') LIKE '{nvr_like}')", "args": [customer_uuid], "purpose": "Remove active non-Navivan lifecycle rows, including old Max submitted/follow-up tracker rows."},
+        {"table": "customer_submission_history", "pk": "history_id", "where": f"customer_uuid = {ph} AND NOT (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(certification_id,'') LIKE '{nvr_like}')", "args": [customer_uuid], "purpose": "Remove old Max cloud submission history while keeping Navivan history."},
         {"table": "customer_forwarder_state", "pk": "forwarder", "where": f"customer_uuid = {ph} AND LOWER(COALESCE(forwarder,'')) <> 'navivan'", "args": [customer_uuid], "purpose": "Clear non-Navivan forwarder state so Max starts fresh."},
         {"table": "customer_runs", "pk": "run_id", "where": f"customer_uuid = {ph} AND LOWER(COALESCE(forwarder,'')) <> 'navivan'", "args": [customer_uuid], "purpose": "Archive old non-Navivan run rows."},
         {"table": "customer_export_references", "pk": "reference_id", "where": f"customer_uuid = {ph} AND LOWER(COALESCE(forwarder,'')) IN ('max_shipping','maxshipping','max shipping','max')", "args": [customer_uuid], "purpose": "Clear old Max cloud export-reference mappings so invoice-first rebuild can assign clean evidence references."},
@@ -1474,7 +1481,8 @@ def admin_max_only_reset():
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
         try:
             specs = max_only_reset_specs(customer_uuid)
-            cur.execute(f"SELECT COUNT(*) FROM customer_refund_lifecycle WHERE customer_uuid = {param()} AND (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(submission_id,'') LIKE 'NVR-%')", (customer_uuid,))
+            nvr_like = max_only_reset_navivan_like_pattern()
+            cur.execute(f"SELECT COUNT(*) FROM customer_refund_lifecycle WHERE customer_uuid = {param()} AND (LOWER(COALESCE(forwarder,'')) = 'navivan' OR COALESCE(submission_id,'') LIKE '{nvr_like}')", (customer_uuid,))
             preserved_navivan = int(scalar(cur.fetchone(), 0) or 0)
             counts = []
             for spec in specs:
