@@ -21,7 +21,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.29.1-max-reset-archive-insert-fix"
+APP_VERSION = "V10.29.2-max-reset-timeout-fix"
 
 app = Flask(__name__)
 
@@ -1776,20 +1776,45 @@ def admin_max_only_reset():
             if dry_run:
                 conn.rollback()
                 return jsonify({"ok": True, "dry_run": True, "would_reset": True, "reset_id": reset_id, "amazon_refund_email": amazon_refund_email, "customer_uuid": customer_uuid, "preserved_navivan_lifecycle_rows": preserved_navivan, "matching_counts": counts, "protected_tables_not_touched": protected, "required_confirm_phrase_for_live_reset": MAX_ONLY_RESET_CONFIRM_PHRASE, "version": APP_VERSION})
+            # V10.29.2: Render's sync worker timed out when the live reset tried to archive
+            # every matched row one-by-one before deleting. The dry run succeeded because it only
+            # counted rows; the live path was doing hundreds of per-row INSERT operations inside
+            # one request. For the Max invoice-first rebuild reset, use a timeout-safe summary
+            # archive by default, then delete the matching Max rows with one DELETE per table.
+            # Protected customer/payment/refund/Navivan tables remain untouched.
+            archive_mode = clean_text(payload.get("archive_mode", "summary"), 50).lower()
+            if archive_mode not in {"summary", "none"}:
+                archive_mode = "summary"
             archived_counts = []
             deleted_counts = []
+            count_by_table = {item.get("table", ""): int(item.get("matching_rows", 0) or 0) for item in counts}
             for spec in specs:
-                cur.execute(f"SELECT * FROM {spec['table']} WHERE {spec['where']}", tuple(spec["args"]))
-                rows = rows_to_dicts(cur, cur.fetchall())
-                for row in rows:
-                    payload_text = json_text(row)
-                    archive_id = "archive_" + hashlib.sha256("|".join([reset_id, spec["table"], clean_text(row.get(spec["pk"], "")), payload_text]).encode("utf-8")).hexdigest()[:32]
-                    cur.execute(f"INSERT INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES ({params(9)})" if postgres_available() else "INSERT OR IGNORE INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (archive_id, reset_id, "max_only_invoice_rebuild_keep_navivan", amazon_refund_email, customer_uuid, spec["table"], clean_text(row.get(spec["pk"], "")), payload_text, utc_now_iso()))
-                archived_counts.append({"table": spec["table"], "archived_rows": len(rows)})
+                matching_rows = int(count_by_table.get(spec["table"], 0) or 0)
+                if archive_mode == "summary":
+                    payload_text = json_text({
+                        "reset_id": reset_id,
+                        "reset_scope": "max_only_invoice_rebuild_keep_navivan",
+                        "archive_mode": "summary",
+                        "table": spec["table"],
+                        "matching_rows_before_reset": matching_rows,
+                        "purpose": spec["purpose"],
+                        "where_clause": spec["where"],
+                        "protected_tables_not_touched": protected,
+                    })
+                    archive_id = "archive_" + hashlib.sha256("|".join([reset_id, spec["table"], "summary", payload_text]).encode("utf-8")).hexdigest()[:32]
+                    cur.execute(
+                        f"INSERT INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES ({params(9)})"
+                        if postgres_available()
+                        else "INSERT OR IGNORE INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (archive_id, reset_id, "max_only_invoice_rebuild_keep_navivan", amazon_refund_email, customer_uuid, spec["table"], "__SUMMARY__", payload_text, utc_now_iso()),
+                    )
+                    archived_counts.append({"table": spec["table"], "archive_mode": "summary", "matching_rows_logged": matching_rows})
+                else:
+                    archived_counts.append({"table": spec["table"], "archive_mode": "none", "matching_rows_not_archived": matching_rows})
                 cur.execute(f"DELETE FROM {spec['table']} WHERE {spec['where']}", tuple(spec["args"]))
                 deleted_counts.append({"table": spec["table"], "deleted_rows": int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)})
             conn.commit()
-            return jsonify({"ok": True, "dry_run": False, "reset_complete": True, "reset_id": reset_id, "amazon_refund_email": amazon_refund_email, "customer_uuid": customer_uuid, "preserved_navivan_lifecycle_rows": preserved_navivan, "matching_counts_before_reset": counts, "archived_counts": archived_counts, "deleted_counts": deleted_counts, "protected_tables_not_touched": protected, "archive_table": "admin_cloud_reset_archive", "version": APP_VERSION})
+            return jsonify({"ok": True, "dry_run": False, "reset_complete": True, "reset_id": reset_id, "amazon_refund_email": amazon_refund_email, "customer_uuid": customer_uuid, "preserved_navivan_lifecycle_rows": preserved_navivan, "matching_counts_before_reset": counts, "archived_counts": archived_counts, "deleted_counts": deleted_counts, "protected_tables_not_touched": protected, "archive_table": "admin_cloud_reset_archive", "archive_mode": archive_mode, "version": APP_VERSION})
         except Exception:
             conn.rollback()
             raise
