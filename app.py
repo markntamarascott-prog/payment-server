@@ -21,7 +21,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.28.4-export-reference-bulk-upsert-fix"
+APP_VERSION = "V10.29.0-max-invoice-controlled-reset"
 
 app = Flask(__name__)
 
@@ -1362,7 +1362,8 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "admin_max_only_reset_enabled": True,
-        "export_reference_resolver_version": "V10.28.4",
+        "export_reference_resolver_version": "V10.29.0",
+        "max_invoice_controlled_reset_version": "V10.29.0",
     })
 
 
@@ -1525,7 +1526,7 @@ def free_export_references_resolve():
             "resolved_references": resolved,
             "resolved_count": len(resolved),
             "access_model": "free_refund_tracker_amazon_email",
-            "resolver_version": "V10.28.4",
+            "resolver_version": "V10.29.0",
             "version": APP_VERSION,
         })
     except PermissionError as exc:
@@ -1539,7 +1540,7 @@ def free_export_references_resolve():
             "ok": False,
             "error": str(exc),
             "error_type": exc.__class__.__name__,
-            "resolver_version": "V10.28.4",
+            "resolver_version": "V10.29.0",
             "version": APP_VERSION,
         }), 500
 
@@ -1783,7 +1784,7 @@ def admin_max_only_reset():
                 for row in rows:
                     payload_text = json_text(row)
                     archive_id = "archive_" + hashlib.sha256("|".join([reset_id, spec["table"], clean_text(row.get(spec["pk"], "")), payload_text]).encode("utf-8")).hexdigest()[:32]
-                    cur.execute(f"INSERT INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES ({params(9)}) ON CONFLICT (archive_id) DO NOTHING" if postgres_available() else "INSERT OR IGNORE INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (archive_id, reset_id, "max_only_keep_navivan", amazon_refund_email, customer_uuid, spec["table"], clean_text(row.get(spec["pk"], "")), payload_text, utc_now_iso()))
+                    cur.execute(f"INSERT INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES ({params(9)}) ON CONFLICT (archive_id) DO NOTHING" if postgres_available() else "INSERT OR IGNORE INTO admin_cloud_reset_archive (archive_id,reset_id,reset_scope,amazon_refund_email,customer_uuid,table_name,row_primary_key,row_payload,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (archive_id, reset_id, "max_only_invoice_rebuild_keep_navivan", amazon_refund_email, customer_uuid, spec["table"], clean_text(row.get(spec["pk"], "")), payload_text, utc_now_iso()))
                 archived_counts.append({"table": spec["table"], "archived_rows": len(rows)})
                 cur.execute(f"DELETE FROM {spec['table']} WHERE {spec['where']}", tuple(spec["args"]))
                 deleted_counts.append({"table": spec["table"], "deleted_rows": int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)})
