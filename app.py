@@ -21,7 +21,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.29.2-max-reset-timeout-fix"
+APP_VERSION = "V10.29.3-yahoo-ledger-STAGING"
 
 app = Flask(__name__)
 
@@ -307,6 +307,33 @@ TABLE_COLUMNS = {
         "customer_uuid": "TEXT NOT NULL", "forwarder": "TEXT NOT NULL", "profile_key": "TEXT NOT NULL",
         "export_year": "TEXT NOT NULL", "last_sequence_number": "INTEGER DEFAULT 0", "updated_at": "TEXT",
     },
+    # A packet is not submitted until the chosen mail provider accepts the message. The ledger is separate
+    # from legacy customer_submission_history, which prior builds populated at
+    # packet GENERATION time. No Gmail tokens, mailbox bodies or local paths here.
+    "customer_submission_packets": {
+        "packet_uuid": "TEXT PRIMARY KEY", "customer_uuid": "TEXT NOT NULL",
+        "forwarder": "TEXT NOT NULL", "profile_key": "TEXT NOT NULL DEFAULT ''",
+        "amazon_account_email": "TEXT NOT NULL", "packet_id": "TEXT NOT NULL",
+        "packet_type": "TEXT NOT NULL", "invoice_reference": "TEXT DEFAULT ''",
+        "file_name": "TEXT NOT NULL", "file_sha256": "TEXT NOT NULL",
+        "requested_total": "TEXT NOT NULL", "status": "TEXT NOT NULL DEFAULT 'READY_TO_SEND'",
+        "sender_email": "TEXT DEFAULT ''", "recipient_email": "TEXT DEFAULT ''",
+        "gmail_message_id": "TEXT DEFAULT ''", "gmail_thread_id": "TEXT DEFAULT ''",  # legacy names retained for compatibility
+        "mail_provider": "TEXT DEFAULT ''", "provider_message_id": "TEXT DEFAULT ''",
+        "transport_receipt_type": "TEXT DEFAULT ''",
+        "send_attempt_id": "TEXT DEFAULT ''", "attempted_at": "TEXT DEFAULT ''",
+        "sent_at": "TEXT DEFAULT ''", "archived_at": "TEXT DEFAULT ''",
+        "created_at": "TEXT NOT NULL", "updated_at": "TEXT NOT NULL",
+    },
+    "customer_submission_packet_orders": {
+        "packet_uuid": "TEXT NOT NULL", "amazon_order_id": "TEXT NOT NULL",
+        "requested_tax": "TEXT NOT NULL DEFAULT '0.00'",
+    },
+    "customer_submission_events": {
+        "event_id": "TEXT PRIMARY KEY", "packet_uuid": "TEXT NOT NULL",
+        "event_type": "TEXT NOT NULL", "event_at": "TEXT NOT NULL",
+        "details_json": "TEXT DEFAULT '{}'",
+    },
     "admin_cloud_reset_archive": {
         "archive_id": "TEXT PRIMARY KEY", "reset_id": "TEXT NOT NULL", "reset_scope": "TEXT DEFAULT ''", "amazon_refund_email": "TEXT DEFAULT ''",
         "customer_uuid": "TEXT DEFAULT ''", "table_name": "TEXT NOT NULL", "row_primary_key": "TEXT DEFAULT ''", "row_payload": "TEXT DEFAULT ''", "created_at": "TEXT",
@@ -349,6 +376,11 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_customer ON customer_export_references (customer_uuid)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_tracking ON customer_export_references (amazon_tracking_number)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_export_references_tracking ON customer_export_references (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_submission_packet_customer_id ON customer_submission_packets (customer_uuid, forwarder, profile_key, packet_id)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_submission_packet_order ON customer_submission_packet_orders (packet_uuid, amazon_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_order_lookup ON customer_submission_packet_orders (amazon_order_id, packet_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_customer_status ON customer_submission_packets (customer_uuid, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_events_packet ON customer_submission_events (packet_uuid, event_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_reset ON admin_cloud_reset_archive (reset_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_customer ON admin_cloud_reset_archive (customer_uuid)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_founding_members_founder_code_nonblank ON founding_members (founder_code) WHERE founder_code IS NOT NULL AND founder_code <> ''")
@@ -1888,6 +1920,336 @@ def stripe_webhook():
         return jsonify({"received": True, "version": APP_VERSION})
     except Exception as exc:
         return jsonify({"error": str(exc), "version": APP_VERSION}), 500
+
+
+
+# --- PROVIDER-NEUTRAL SUBMISSION MANAGER LEDGER (STAGING ONLY) ---
+# Customer mail operations are NEVER performed by this backend. The future desktop
+# Gmail OAuth client will do a customer-confirmed send, then record the returned
+# message ID. A send timeout is not evidence that the email was NOT sent.
+
+SUBMISSION_STATUSES = frozenset((
+    "READY_TO_SEND", "NEEDS_PROOF_REVIEW", "SEND_IN_PROGRESS", "SEND_UNCERTAIN", "SENT"
+))
+SUBMISSION_LOCKED = frozenset(("SEND_IN_PROGRESS", "SEND_UNCERTAIN", "SENT"))
+_AMAZON_ORDER_FULL_RE = re.compile(r"\d{3}-\d{7}-\d{7}\Z")
+_SHA256_HEX_RE = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def _submission_row(cur, row):
+    return row_to_dict(cur, row)
+
+
+def _submission_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
+
+
+def _submission_event(cur, packet_uuid, event_type, details=None):
+    details = details if isinstance(details, dict) else {}
+    # Never save Gmail OAuth credentials or email message bodies in this ledger.
+    allowed = {k: details[k] for k in ("message_id", "reason", "archive_status") if k in details}
+    cur.execute(
+        f"INSERT INTO customer_submission_events (event_id,packet_uuid,event_type,event_at,details_json) VALUES ({params(5)})",
+        (str(uuid.uuid4()), packet_uuid, event_type, utc_now_iso(), json.dumps(allowed, sort_keys=True)),
+    )
+
+
+def _submission_authorize(payload):
+    ok, reason, email = validate_customer_access_payload(payload)
+    if not ok:
+        raise PermissionError(reason)
+    customer = resolve_authorized_customer(payload, email)
+    return customer["customer_uuid"], email
+
+
+def _submission_validate_registration(payload):
+    packet_id = clean_text(payload.get("packet_id", ""), 180)
+    packet_type = clean_text(payload.get("packet_type", ""), 100)
+    invoice = clean_text(payload.get("invoice_reference", ""), 250)
+    file_name = clean_text(payload.get("file_name", ""), 255)
+    file_hash = clean_text(payload.get("file_sha256", "")).lower()
+    profile = clean_text(payload.get("profile_key", ""), 180)
+    forwarder = clean_text(payload.get("forwarder", "")).lower()
+    amazon_email = normalize_email(payload.get("amazon_account_email", ""))
+    proof = clean_text(payload.get("proof_status", "")).upper()
+    if not all((packet_id, packet_type, file_name, profile, forwarder, amazon_email)):
+        raise ValueError("packet_id, packet_type, file_name, profile_key, forwarder, amazon_account_email are required.")
+    if not _SHA256_HEX_RE.fullmatch(file_hash):
+        raise ValueError("file_sha256 must be a lowercase or uppercase 64-character SHA256 digest.")
+    if '/' in file_name or '\\' in file_name or file_name.lower().endswith('.pdf') is False:
+        raise ValueError("file_name must be the PDF basename, not a local path.")
+    if packet_type not in ("MAX_INVOICE", "EXISTING_SIGNED_NOTARIZED_MAX_PROOF"):
+        raise ValueError("Unsupported packet_type.")
+    rows = payload.get("orders")
+    if not isinstance(rows, list) or not rows or len(rows) > 5000:
+        raise ValueError("orders must contain 1 to 5000 Amazon order records.")
+    normalized = []
+    seen = set()
+    from decimal import Decimal, InvalidOperation
+    total = Decimal('0.00')
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Each order must be an object.")
+        order_id = clean_text(row.get("amazon_order_id", ""))
+        if not _AMAZON_ORDER_FULL_RE.fullmatch(order_id) or order_id in seen:
+            raise ValueError("Each packet requires unique valid Amazon order numbers.")
+        seen.add(order_id)
+        try:
+            amount = Decimal(str(row.get("requested_tax", "")))
+            if not amount.is_finite() or amount <= 0 or amount != amount.quantize(Decimal('0.01')):
+                raise ValueError()
+        except (ValueError, TypeError, InvalidOperation):
+            raise ValueError(f"Invalid positive tax amount for order {order_id}.")
+        total += amount
+        normalized.append((order_id, str(amount.quantize(Decimal('0.01')))))
+    try:
+        request_total = Decimal(str(payload.get('requested_total', '')))
+    except (InvalidOperation, TypeError):
+        raise ValueError("requested_total is required as a decimal amount.")
+    if request_total != total:
+        raise ValueError("Sum of order taxes does not match packet requested_total.")
+    return {
+        'packet_id':packet_id, 'packet_type':packet_type,'invoice_reference':invoice,
+        'file_name':file_name,'file_sha256':file_hash,'profile_key':profile,
+        'forwarder':forwarder,'amazon_account_email':amazon_email,
+        'requested_total':str(total.quantize(Decimal('0.01'))),
+        'status': 'READY_TO_SEND' if proof in ('READY_FOR_REVIEW','EXISTING_PROOF_COVERS_ALL_PACKET_ORDERS') else 'NEEDS_PROOF_REVIEW',
+        'orders':normalized,
+    }
+
+
+def _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=False):
+    sql = f"SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND packet_uuid={param()}"
+    if lock and postgres_available():
+        sql += ' FOR UPDATE'
+    cur.execute(sql, (customer_uuid, packet_uuid))
+    row = cur.fetchone()
+    if row is None:
+        raise LookupError("Packet not found in this customer account.")
+    return _submission_row(cur, row)
+
+
+def _submission_locked_order_conflict(cur, packet):
+    # Blocks overlapping Amazon orders even if the invoice or report ID differs.
+    sql = (
+        'SELECT o.amazon_order_id,p.packet_id,p.status FROM customer_submission_packet_orders o '
+        'JOIN customer_submission_packets p ON p.packet_uuid=o.packet_uuid '
+        f'WHERE p.customer_uuid={param()} AND p.amazon_account_email={param()} '
+        f'AND p.packet_uuid<>{param()} AND p.status IN (\'SEND_IN_PROGRESS\',\'SEND_UNCERTAIN\',\'SENT\') '
+        f'AND o.amazon_order_id IN (SELECT amazon_order_id FROM customer_submission_packet_orders WHERE packet_uuid={param()}) '
+        'LIMIT 1'
+    )
+    cur.execute(sql,(packet['customer_uuid'],packet['amazon_account_email'],packet['packet_uuid'],packet['packet_uuid']))
+    return _submission_row(cur, cur.fetchone()) if cur.description else None
+
+
+def _submission_endpoint_errors(exc):
+    if isinstance(exc, PermissionError): code=403
+    elif isinstance(exc, LookupError): code=404
+    elif isinstance(exc, ValueError): code=400
+    elif isinstance(exc, RuntimeError): code=409
+    else: code=500
+    return jsonify({'ok': False, 'error': str(exc), 'version': APP_VERSION}), code
+
+
+@app.route('/customer/submission-manager/register', methods=['POST'])
+def submission_manager_register():
+    payload, error = require_json_payload()
+    if error: return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid, customer_email = _submission_authorize(payload)
+        item = _submission_validate_registration(payload)
+        if customer_email != item['amazon_account_email']:
+            raise PermissionError('Amazon account email must match the authorized customer email.')
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            if not postgres_available(): cur.execute('BEGIN IMMEDIATE')
+            cur.execute(
+                f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND forwarder={param()} AND profile_key={param()} AND packet_id={param()}' + (' FOR UPDATE' if postgres_available() else ''),
+                (customer_uuid,item['forwarder'],item['profile_key'],item['packet_id']))
+            old = _submission_row(cur, cur.fetchone())
+            now = utc_now_iso()
+            if old and old['status'] in SUBMISSION_LOCKED:
+                if old['file_sha256'] != item['file_sha256']:
+                    raise RuntimeError('An active or sent packet cannot be replaced with different PDF bytes.')
+                # Immutable after the sending process begins.
+                conn.commit()
+                return jsonify({'ok':True,'packet_uuid':old['packet_uuid'],'status':old['status'],'already_registered':True,'version':APP_VERSION})
+            packet_uuid = old['packet_uuid'] if old else str(uuid.uuid4())
+            if old:
+                cur.execute(
+                    f'UPDATE customer_submission_packets SET packet_type={param()}, invoice_reference={param()}, file_name={param()}, file_sha256={param()}, requested_total={param()}, status={param()}, updated_at={param()} WHERE packet_uuid={param()}',
+                    (item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],item['status'],now,packet_uuid))
+                cur.execute(f'DELETE FROM customer_submission_packet_orders WHERE packet_uuid={param()}',(packet_uuid,))
+            else:
+                cur.execute(
+                    f'INSERT INTO customer_submission_packets (packet_uuid,customer_uuid,forwarder,profile_key,amazon_account_email,packet_id,packet_type,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at) VALUES ({params(14)})',
+                    (packet_uuid,customer_uuid,item['forwarder'],item['profile_key'],item['amazon_account_email'],item['packet_id'],item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],item['status'],now,now))
+            for order_id, amount in item['orders']:
+                cur.execute(f'INSERT INTO customer_submission_packet_orders (packet_uuid,amazon_order_id,requested_tax) VALUES ({params(3)})',(packet_uuid,order_id,amount))
+            _submission_event(cur,packet_uuid,'PACKET_REGISTERED')
+            conn.commit()
+            return jsonify({'ok':True,'packet_uuid':packet_uuid,'status':item['status'],'already_registered':bool(old),'version':APP_VERSION})
+        except Exception:
+            conn.rollback()
+            raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/list', methods=['POST'])
+def submission_manager_list():
+    payload, error = require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_ = _submission_authorize(payload)
+        init_db()
+        packets=execute_all(f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} ORDER BY created_at DESC',(customer_uuid,))
+        conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            for packet in packets:
+                cur.execute(f'SELECT amazon_order_id,requested_tax FROM customer_submission_packet_orders WHERE packet_uuid={param()} ORDER BY amazon_order_id',(packet['packet_uuid'],))
+                packet['orders']=rows_to_dicts(cur,cur.fetchall())
+        finally:conn.close()
+        return jsonify({'ok':True,'packets':packets,'version':APP_VERSION})
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/begin-send', methods=['POST'])
+def submission_manager_begin_send():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        file_hash=clean_text(payload.get('file_sha256','')).lower()
+        sender_email=normalize_email(payload.get('sender_email',''))
+        recipient_email=normalize_email(payload.get('recipient_email',''))
+        mail_provider=clean_text(payload.get('mail_provider','')).lower()
+        if mail_provider not in ('yahoo_smtp', 'gmail_api', 'microsoft_graph'):
+            raise ValueError('Unsupported mail provider for this submission.')
+        if not _SHA256_HEX_RE.fullmatch(file_hash) or not sender_email or '@' not in sender_email or not recipient_email or '@' not in recipient_email:
+            raise ValueError('PDF fingerprint, sender and recipient are required.')
+        init_db(); conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if postgres_available():
+                # Serialize all send reservations for the same customer to avoid
+                # races between different packets that contain one Amazon order.
+                cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(customer_uuid,))
+            else:cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if sender_email != normalize_email(packet['amazon_account_email']):
+                raise PermissionError('Sending mailbox must match the Amazon-linked account email exactly.')
+            if packet['status']!='READY_TO_SEND':
+                raise RuntimeError(f"Packet cannot be sent from status {packet['status']}.")
+            if packet['file_sha256']!=file_hash:
+                raise RuntimeError('Packet PDF has changed since registration. Re-register and review the new PDF.')
+            conflict=_submission_locked_order_conflict(cur,packet)
+            if conflict:
+                raise RuntimeError(f"Amazon order {conflict['amazon_order_id']} is already in active/sent packet {conflict['packet_id']}; review before continuing.")
+            attempt_id=str(uuid.uuid4()); now=utc_now_iso()
+            cur.execute(
+                f"UPDATE customer_submission_packets SET status='SEND_IN_PROGRESS',send_attempt_id={param()},attempted_at={param()},sender_email={param()},recipient_email={param()},mail_provider={param()},updated_at={param()} WHERE packet_uuid={param()}",
+                (attempt_id,now,sender_email,recipient_email,mail_provider,now,packet_uuid))
+            _submission_event(cur,packet_uuid,'SEND_RESERVED')
+            conn.commit()
+            return jsonify({'ok':True,'packet_uuid':packet_uuid,'send_attempt_id':attempt_id,'status':'SEND_IN_PROGRESS','version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/confirm-sent', methods=['POST'])
+def submission_manager_confirm_sent():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        attempt_id=clean_text(payload.get('send_attempt_id',''))
+        message_id=clean_text(payload.get('provider_message_id') or payload.get('gmail_message_id',''),250)
+        receipt_type=clean_text(payload.get('transport_receipt_type') or '',60)
+        thread_id=clean_text(payload.get('gmail_thread_id',''),250)
+        if not (packet_uuid and attempt_id and message_id):
+            raise ValueError('packet_uuid, send_attempt_id and provider Message-ID are required.')
+        if receipt_type not in ('SMTP_SERVER_ACCEPTED','PROVIDER_API_ACCEPTED'):
+            raise ValueError('Supported transport acceptance receipt is required.')
+        init_db();conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if not postgres_available():cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if packet['send_attempt_id'] != attempt_id:
+                raise RuntimeError('Attempt ID mismatch; submission was not recorded.')
+            if packet['status']=='SENT' and (packet.get('provider_message_id') or packet.get('gmail_message_id'))==message_id:
+                conn.commit();return jsonify({'ok':True,'status':'SENT','already_confirmed':True,'version':APP_VERSION})
+            if packet['status'] not in ('SEND_IN_PROGRESS','SEND_UNCERTAIN'):
+                raise RuntimeError(f"Cannot confirm sending from {packet['status']} status.")
+            now=utc_now_iso()
+            cur.execute(
+                f"UPDATE customer_submission_packets SET status='SENT',provider_message_id={param()},transport_receipt_type={param()},gmail_thread_id={param()},sent_at={param()},updated_at={param()} WHERE packet_uuid={param()}",
+                (message_id,receipt_type,thread_id,now,now,packet_uuid))
+            _submission_event(cur,packet_uuid,'MAIL_PROVIDER_ACCEPTED',{'message_id':message_id})
+            # Do not update legacy order lifecycle via the report-wide submission
+            # ID: one report may create multiple invoice packets. The new ledger
+            # retains invoice -> order mappings without double-counting.
+            conn.commit()
+            return jsonify({'ok':True,'status':'SENT','sent_at':now,'version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/send-uncertain', methods=['POST'])
+def submission_manager_send_uncertain():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        attempt_id=clean_text(payload.get('send_attempt_id',''))
+        init_db();conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if not postgres_available():cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if packet['send_attempt_id']!=attempt_id:raise RuntimeError('Attempt ID mismatch.')
+            if packet['status']=='SEND_UNCERTAIN':
+                conn.commit();return jsonify({'ok':True,'status':'SEND_UNCERTAIN','version':APP_VERSION})
+            if packet['status']!='SEND_IN_PROGRESS':raise RuntimeError('The packet is not currently sending.')
+            now=utc_now_iso()
+            cur.execute(f"UPDATE customer_submission_packets SET status='SEND_UNCERTAIN',updated_at={param()} WHERE packet_uuid={param()}",(now,packet_uuid))
+            _submission_event(cur,packet_uuid,'SEND_RESULT_UNCERTAIN')
+            conn.commit();return jsonify({'ok':True,'status':'SEND_UNCERTAIN','version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/archive', methods=['POST'])
+def submission_manager_archive():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        init_db();conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if not postgres_available():cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if packet['status']!='SENT':raise RuntimeError('Only mail-provider-accepted packets can be archived.')
+            now=utc_now_iso()
+            cur.execute(f'UPDATE customer_submission_packets SET archived_at={param()},updated_at={param()} WHERE packet_uuid={param()}',(now,now,packet_uuid))
+            _submission_event(cur,packet_uuid,'LOCAL_ARCHIVE_CONFIRMED',{'archive_status':'archived'})
+            conn.commit();return jsonify({'ok':True,'archived_at':now,'version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
 
 
 if __name__ == "__main__":
