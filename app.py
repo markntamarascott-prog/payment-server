@@ -1,4 +1,10 @@
 import hashlib
+import hmac
+import secrets
+import smtplib
+from urllib.request import Request as _ResendRequest, build_opener as _resend_build_opener, HTTPRedirectHandler as _ResendRedirectHandler
+from urllib.error import HTTPError as _ResendHTTPError, URLError as _ResendURLError
+from email.message import EmailMessage
 import json
 import os
 import re
@@ -21,7 +27,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.29.3-yahoo-ledger-STAGING"
+APP_VERSION = "V10.29.5-customer-auth-resend-STAGING"
 
 app = Flask(__name__)
 
@@ -334,6 +340,23 @@ TABLE_COLUMNS = {
         "event_type": "TEXT NOT NULL", "event_at": "TEXT NOT NULL",
         "details_json": "TEXT DEFAULT '{}'",
     },
+    # Additive, isolated customer-email authorization tables. The existing
+    # founder/payment and submission tables are deliberately not changed.
+    "customer_auth_challenges": {
+        "challenge_uuid": "TEXT PRIMARY KEY", "email": "TEXT NOT NULL",
+        "code_hash": "TEXT NOT NULL", "created_at": "TEXT NOT NULL",
+        "expires_at": "TEXT NOT NULL", "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "consumed_at": "TEXT DEFAULT ''", "send_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+    },
+    "customer_auth_sessions": {
+        "token_hash": "TEXT PRIMARY KEY", "customer_uuid": "TEXT NOT NULL",
+        "created_at": "TEXT NOT NULL", "expires_at": "TEXT NOT NULL",
+        "revoked_at": "TEXT DEFAULT ''",
+    },
+    "customer_auth_rate_events": {
+        "event_uuid": "TEXT PRIMARY KEY", "rate_key": "TEXT NOT NULL",
+        "created_at": "TEXT NOT NULL",
+    },
     "admin_cloud_reset_archive": {
         "archive_id": "TEXT PRIMARY KEY", "reset_id": "TEXT NOT NULL", "reset_scope": "TEXT DEFAULT ''", "amazon_refund_email": "TEXT DEFAULT ''",
         "customer_uuid": "TEXT DEFAULT ''", "table_name": "TEXT NOT NULL", "row_primary_key": "TEXT DEFAULT ''", "row_payload": "TEXT DEFAULT ''", "created_at": "TEXT",
@@ -381,6 +404,9 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_order_lookup ON customer_submission_packet_orders (amazon_order_id, packet_uuid)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_customer_status ON customer_submission_packets (customer_uuid, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_events_packet ON customer_submission_events (packet_uuid, event_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenge_email_created ON customer_auth_challenges (email, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_session_customer ON customer_auth_sessions (customer_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_rate_key_created ON customer_auth_rate_events (rate_key, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_reset ON admin_cloud_reset_archive (reset_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_customer ON admin_cloud_reset_archive (customer_uuid)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_founding_members_founder_code_nonblank ON founding_members (founder_code) WHERE founder_code IS NOT NULL AND founder_code <> ''")
@@ -1393,6 +1419,7 @@ def index():
         "cloud_refund_lifecycle_enabled": True,
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
+        "staging_email_auth_enabled": _auth_enabled(),
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2250,6 +2277,432 @@ def submission_manager_archive():
         except Exception:conn.rollback();raise
         finally:conn.close()
     except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+
+# -----------------------------------------------------------------------------
+# V10.29.4 - Opt-in, STAGING-ONLY email code authentication.
+#
+# A validated mailbox is not proof of Amazon ownership, a paid entitlement, or
+# authorization to send claims. Thus these routes are READ ONLY except for
+# authentication state, and existing refund submission APIs stay unchanged.
+#
+# Starts DISABLED in every environment. Requires an independently provisioned
+# application-owned mail sender (NOT the customer's Yahoo app password) and a
+# random HMAC pepper. No email, account, or DB mutation occurs at import time.
+# -----------------------------------------------------------------------------
+
+_AUTH_EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}\Z")
+_AUTH_CHALLENGE_MAX_ATTEMPTS = 5
+_AUTH_CHALLENGE_LIFETIME = timedelta(minutes=10)
+_AUTH_SESSION_LIFETIME = timedelta(days=30)
+
+
+def _auth_enabled():
+    return APP_VERSION.endswith("-STAGING") and safe_bool(os.environ.get("SHIPTAXREFUND_STAGING_AUTH_ENABLED", ""))
+
+
+def _auth_pepper():
+    value = os.environ.get("SHIPTAXREFUND_AUTH_HMAC_KEY", "")
+    return value.encode("utf-8") if len(value) >= 32 else b""
+
+
+def _auth_email(value):
+    value = normalize_email(value)
+    return value if len(value) <= 254 and _AUTH_EMAIL_RE.fullmatch(value) else ""
+
+
+def _auth_email_allowlisted(email):
+    # In STAGING, explicitly authorize only the pilot mailboxes. This prevents
+    # a publicly accessible test API from becoming an arbitrary mail sender.
+    configured = os.environ.get("SHIPTAXREFUND_AUTH_ALLOWED_EMAILS", "")
+    allowed = {_auth_email(item) for item in configured.split(",")}
+    return bool(email) and email in allowed
+
+
+def _auth_hmac(purpose, value):
+    pepper = _auth_pepper()
+    if not pepper:
+        raise RuntimeError("Authentication is not configured.")
+    return hmac.new(pepper, (purpose + "|" + value).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _auth_email_provider():
+    # Explicit selection only. Legacy SMTP option stays for private paid-instance
+    # compatibility, but Render Free's SMTP ports cannot be used.
+    return os.environ.get("SHIPTAXREFUND_AUTH_EMAIL_PROVIDER", "smtp").strip().lower()
+
+
+def _auth_resend_settings():
+    api_key = os.environ.get("SHIPTAXREFUND_AUTH_RESEND_API_KEY", "").strip()
+    from_addr = _auth_email(os.environ.get("SHIPTAXREFUND_AUTH_RESEND_FROM", ""))
+    # This staging app is exclusively for ShipTaxRefund's approved sender.
+    # Keys remain SERVER-side on Render, never in the customer's desktop.
+    if (not api_key.startswith("re_") or not 15 <= len(api_key) <= 300 or
+            any(ch.isspace() for ch in api_key) or
+            from_addr != "support@shiptaxrefund.com"):
+        return None
+    return api_key, from_addr
+
+
+def _auth_smtp_settings():
+    host = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_HOST", "").strip()
+    mode = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_TLS", "ssl").strip().lower()
+    from_addr = _auth_email(os.environ.get("SHIPTAXREFUND_AUTH_SMTP_FROM", ""))
+    username = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_USERNAME", "").strip()
+    password = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_PASSWORD", "")
+    try:
+        port = int(os.environ.get("SHIPTAXREFUND_AUTH_SMTP_PORT", "465" if mode == "ssl" else "587"))
+    except (ValueError, TypeError):
+        port = 0
+    if not all((host, from_addr, username, password, 1 <= port <= 65535)) or mode not in {"ssl", "starttls"}:
+        return None
+    return host, port, from_addr, username, password, mode
+
+
+def _auth_mail_configured():
+    provider = _auth_email_provider()
+    if provider == "resend":
+        return _auth_resend_settings() is not None
+    if provider == "smtp":
+        return _auth_smtp_settings() is not None
+    return False
+
+
+class _NoResendRedirects(_ResendRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _resend_https_open(req, timeout=20):
+    # Do not follow any HTTP 30x redirects with a Bearer secret attached.
+    return _resend_build_opener(_NoResendRedirects()).open(req, timeout=timeout)
+
+
+def _auth_send_resend(email, code, challenge_uuid, opener=None):
+    settings = _auth_resend_settings()
+    if not settings:
+        raise RuntimeError("Resend authentication email is not configured")
+    if not _auth_email_allowlisted(_auth_email(email)):
+        raise RuntimeError("Recipient not allowlisted")
+    if not re.fullmatch(r"[0-9]{6}", str(code)):
+        raise RuntimeError("Invalid confirmation code")
+    if not re.fullmatch(r"[a-fA-F0-9-]{36}", str(challenge_uuid)):
+        raise RuntimeError("Invalid challenge reference")
+    api_key, from_addr = settings
+    message = {
+        "from": from_addr,
+        "to": [email],
+        "subject": "ShipTaxRefund STAGING sign-in code",
+        "text": (
+            "Your ShipTaxRefund STAGING sign-in code is " + code + ".\n"
+            "It expires in 10 minutes. If you did not request this, ignore it.\n"
+            "This code never authorizes an Amazon refund submission.\n"
+        ),
+    }
+    request = _ResendRequest(
+        "https://api.resend.com/emails",
+        data=json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "Idempotency-Key": "shiptaxrefund-staging-login-" + challenge_uuid,
+        },
+        method="POST",
+    )
+    # No automatic HTTP retry. A timeout can occur *after* Resend accepts a send;
+    # marking UNKNOWN/FAILED in local challenge prevents issuing that code.
+    # The provider idempotency key also prevents duplicates for this challenge.
+    try:
+        with (opener or _resend_https_open)(request, timeout=20) as response:
+            status = int(response.status)
+            data = response.read(16385)
+        if status not in (200, 201) or len(data) > 16384:
+            raise RuntimeError("Resend provider did not confirm API acceptance")
+        result = json.loads(data.decode("utf-8"))
+        if not isinstance(result, dict) or not re.fullmatch(r"[a-zA-Z0-9-]{10,100}", str(result.get("id", ""))):
+            raise RuntimeError("Resend provider returned no valid accepted email id")
+    except (_ResendHTTPError, _ResendURLError, TimeoutError, ValueError, UnicodeError) as exc:
+        # Never log/echo provider raw responses, full headers, API key or code.
+        raise RuntimeError("Resend API acceptance was not confirmed") from None
+    return True
+
+def _auth_ready(require_email=False):
+    # Never accidentally activate these APIs on main / with production Stripe.
+    if not _auth_enabled() or bool(STRIPE_SECRET_KEY) or bool(STRIPE_WEBHOOK_SECRET):
+        return False
+    if not _auth_pepper():
+        return False
+    if not (postgres_available() or sqlite_fallback_allowed()):
+        return False
+    return not require_email or _auth_mail_configured()
+
+
+def _auth_json_error(status, reason):
+    return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+
+
+def _auth_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
+
+
+def _auth_send_mail(email, code, challenge_uuid=None):
+    if _auth_email_provider() == "resend":
+        return _auth_send_resend(email, code, challenge_uuid)
+    if _auth_email_provider() != "smtp":
+        raise RuntimeError("Authentication email provider is unsupported")
+    settings = _auth_smtp_settings()
+    if not settings:
+        raise RuntimeError("Authentication email is not configured.")
+    host, port, from_addr, username, password, mode = settings
+    message = EmailMessage()
+    message["From"] = from_addr
+    message["To"] = email
+    message["Subject"] = "ShipTaxRefund STAGING sign-in code"
+    message.set_content(
+        "Your ShipTaxRefund STAGING sign-in code is " + code + ".\n"
+        "It expires in 10 minutes. If you did not request this, ignore it.\n"
+        "This code never authorizes an Amazon refund submission.\n"
+    )
+    # TLS required; deliberately uses an application-owned mailbox, not the
+    # Yahoo account proven in the completed email-delivery proof of concept.
+    if mode == "ssl":
+        with smtplib.SMTP_SSL(host, port, timeout=20) as conn:
+            conn.login(username, password)
+            conn.send_message(message)
+    else:
+        with smtplib.SMTP(host, port, timeout=20) as conn:
+            conn.ehlo()
+            conn.starttls()
+            conn.ehlo()
+            conn.login(username, password)
+            conn.send_message(message)
+
+
+def _auth_lock_request(cur, email):
+    # The database transaction and per-email advisory lock serialize
+    # rate-limited code requests even across several Render workers.
+    if postgres_available():
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_auth_hmac("rate-email", email),))
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+
+
+def _auth_rate_allow(cur, email):
+    now = utc_now()
+    hour = (now - timedelta(hours=1)).isoformat()
+    day = (now - timedelta(days=1)).isoformat()
+    email_key = _auth_hmac("rate-email", email)
+    # Deliberately uses WSGI remote address, not untrusted X-Forwarded-For.
+    source_key = _auth_hmac("rate-ip", str(request.remote_addr or "unknown"))
+    for key, since, maximum in ((email_key, hour, 5), (email_key, day, 12), (source_key, hour, 60)):
+        cur.execute(f"SELECT COUNT(*) AS amount FROM customer_auth_rate_events WHERE rate_key={param()} AND created_at>={param()}", (key, since))
+        if int(scalar(cur.fetchone(), 0)) >= maximum:
+            return False
+    for key in (email_key, source_key):
+        cur.execute(f"INSERT INTO customer_auth_rate_events (event_uuid, rate_key, created_at) VALUES ({params(3)})", (str(uuid.uuid4()), key, now.isoformat()))
+    return True
+
+
+@app.route("/customer/auth/request-code", methods=["POST"])
+def customer_auth_request_code():
+    if not _auth_ready(require_email=True):
+        return _auth_json_error(503, "STAGING email sign-in is not enabled or configured.")
+    payload, error = require_json_payload()
+    if error or not isinstance(payload, dict):
+        return _auth_json_error(400, "Invalid JSON payload.")
+    email = _auth_email(payload.get("email", ""))
+    if not email:
+        return _auth_json_error(400, "Valid email is required.")
+    # Non-allowlisted pilot mailboxes receive the same accepted response as
+    # normal requests, but no code is generated or sent.
+    if not _auth_email_allowlisted(email):
+        return jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION}), 202
+    # This identical response intentionally discloses no account existence.
+    accepted = jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION})
+    code = "{:06d}".format(secrets.randbelow(1000000))
+    challenge_uuid = str(uuid.uuid4())
+    now = utc_now()
+    init_db()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        _auth_lock_request(cur, email)
+        if not _auth_rate_allow(cur, email):
+            conn.commit()
+            return accepted, 202
+        cur.execute(f"INSERT INTO customer_auth_challenges (challenge_uuid,email,code_hash,created_at,expires_at,attempts,consumed_at,send_status) VALUES ({params(8)})",
+                    (challenge_uuid, email, _auth_hmac("code:" + challenge_uuid, code), now.isoformat(),
+                     (now + _AUTH_CHALLENGE_LIFETIME).isoformat(), 0, "", "PENDING"))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        app.logger.error("STAGING auth request failed before sending (details withheld)")
+        return _auth_json_error(503, "Authentication service is temporarily unavailable.")
+    finally:
+        conn.close()
+
+    try:
+        _auth_send_mail(email, code, challenge_uuid=challenge_uuid)
+    except Exception as exc:
+        # Never log passwords, codes, message bodies, or SMTP raw responses.
+        app.logger.error("STAGING auth email not confirmed: %s", type(exc).__name__)
+        conn = get_db_connection()
+        try:
+            cur = _auth_cursor(conn)
+            cur.execute(f"UPDATE customer_auth_challenges SET send_status={param()} WHERE challenge_uuid={param()}", ("FAILED", challenge_uuid))
+            conn.commit()
+        finally:
+            conn.close()
+        return _auth_json_error(503, "Verification email could not be confirmed. Please try later.")
+
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_challenges SET send_status={param()} WHERE challenge_uuid={param()}", ("SENT", challenge_uuid))
+        conn.commit()
+    finally:
+        conn.close()
+    return accepted, 202
+
+
+@app.route("/customer/auth/verify-code", methods=["POST"])
+def customer_auth_verify_code():
+    if not _auth_ready():
+        return _auth_json_error(503, "STAGING email sign-in is not enabled or configured.")
+    payload, error = require_json_payload()
+    if error or not isinstance(payload, dict):
+        return _auth_json_error(400, "Invalid JSON payload.")
+    email = _auth_email(payload.get("email", ""))
+    code = str(payload.get("code", "") or "").strip()
+    if not email or not re.fullmatch(r"[0-9]{6}", code):
+        return _auth_json_error(400, "Valid email and six-digit code are required.")
+    if not _auth_email_allowlisted(email):
+        return _auth_json_error(401, "Code invalid, expired, or already used.")
+    init_db()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        if not postgres_available():
+            cur.execute("BEGIN IMMEDIATE")
+        sql = f"SELECT * FROM customer_auth_challenges WHERE email={param()} ORDER BY created_at DESC, challenge_uuid DESC LIMIT 1"
+        if postgres_available():
+            sql += " FOR UPDATE"
+        cur.execute(sql, (email,))
+        item = row_to_dict(cur, cur.fetchone())
+        if not item or item["send_status"] != "SENT" or item["consumed_at"] or int(item["attempts"]) >= _AUTH_CHALLENGE_MAX_ATTEMPTS or datetime.fromisoformat(str(item["expires_at"])) < utc_now():
+            conn.rollback()
+            return _auth_json_error(401, "Code invalid, expired, or already used.")
+        cur.execute(f"UPDATE customer_auth_challenges SET attempts=attempts+1 WHERE challenge_uuid={param()}", (item["challenge_uuid"],))
+        expected = _auth_hmac("code:" + item["challenge_uuid"], code)
+        if not hmac.compare_digest(expected, item["code_hash"]):
+            conn.commit()
+            return _auth_json_error(401, "Code invalid, expired, or already used.")
+        cur.execute(f"UPDATE customer_auth_challenges SET consumed_at={param()} WHERE challenge_uuid={param()}", (utc_now_iso(), item["challenge_uuid"]))
+        cur.execute(f"SELECT customer_uuid FROM customers WHERE LOWER(email)={param()}", (email,))
+        prior = row_to_dict(cur, cur.fetchone())
+        customer_uuid = prior["customer_uuid"] if prior else str(uuid.uuid4())
+        if not prior:
+            now = utc_now_iso()
+            cur.execute(f"INSERT INTO customers (customer_uuid,email,display_name,source,created_at,updated_at) VALUES ({params(6)})",
+                        (customer_uuid, email, "", "staging_email_verified", now, now))
+        raw_token = secrets.token_urlsafe(48)
+        now = utc_now()
+        cur.execute(f"INSERT INTO customer_auth_sessions (token_hash,customer_uuid,created_at,expires_at,revoked_at) VALUES ({params(5)})",
+                    (_auth_hmac("session", raw_token), customer_uuid, now.isoformat(), (now + _AUTH_SESSION_LIFETIME).isoformat(), ""))
+        conn.commit()
+        # Return only once; only an HMAC of the token is retained in cloud DB.
+        return jsonify({"ok": True, "access_token": raw_token, "token_type": "Bearer", "expires_at": (now + _AUTH_SESSION_LIFETIME).isoformat(), "email": email, "version": APP_VERSION}), 200
+    except Exception:
+        conn.rollback()
+        app.logger.error("STAGING verification failed internally (details withheld)")
+        return _auth_json_error(503, "Authentication service temporarily unavailable.")
+    finally:
+        conn.close()
+
+
+def _auth_current_customer():
+    if not _auth_ready():
+        return None
+    auth = str(request.headers.get("Authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:].strip()
+    if not 40 <= len(token) <= 200 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        return None
+    row = execute_one(
+        f"SELECT s.customer_uuid,c.email,c.display_name,s.expires_at,s.revoked_at FROM customer_auth_sessions s "
+        f"JOIN customers c ON c.customer_uuid=s.customer_uuid WHERE s.token_hash={param()}",
+        (_auth_hmac("session", token),),
+    )
+    if not row or row["revoked_at"] or datetime.fromisoformat(str(row["expires_at"])) < utc_now():
+        return None
+    return row
+
+
+@app.route("/customer/auth/me", methods=["GET"])
+def customer_auth_me():
+    if not _auth_ready():
+        return _auth_json_error(503, "STAGING email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    return jsonify({"ok": True, "email": customer["email"], "display_name": customer["display_name"], "version": APP_VERSION})
+
+
+@app.route("/customer/auth/packets", methods=["GET"])
+def customer_auth_packets():
+    if not _auth_ready():
+        return _auth_json_error(503, "STAGING email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    rows = execute_all(
+        f"SELECT packet_uuid,packet_id,forwarder,profile_key,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at "
+        f"FROM customer_submission_packets WHERE customer_uuid={param()} ORDER BY created_at DESC LIMIT 500",
+        (customer["customer_uuid"],),
+    )
+    return jsonify({"ok": True, "packets": rows, "version": APP_VERSION})
+
+
+@app.route("/customer/auth/logout", methods=["POST"])
+def customer_auth_logout():
+    if not _auth_ready():
+        return _auth_json_error(503, "STAGING email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    supplied = str(request.headers.get("Authorization", ""))[7:].strip()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_sessions SET revoked_at={param()} WHERE token_hash={param()} AND customer_uuid={param()}",
+                    (utc_now_iso(), _auth_hmac("session", supplied), customer["customer_uuid"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "version": APP_VERSION})
+
+
+@app.route("/customer/auth/revoke-other-sessions", methods=["POST"])
+def customer_auth_revoke_other_sessions():
+    # Allows a newly verified mailbox owner to revoke credentials on lost PCs.
+    if not _auth_ready():
+        return _auth_json_error(503, "STAGING email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    supplied = str(request.headers.get("Authorization", ""))[7:].strip()
+    current_hash = _auth_hmac("session", supplied)
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_sessions SET revoked_at={param()} WHERE customer_uuid={param()} AND token_hash<>{param()} AND (revoked_at IS NULL OR revoked_at='')",
+                    (utc_now_iso(), customer["customer_uuid"], current_hash))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 if __name__ == "__main__":
