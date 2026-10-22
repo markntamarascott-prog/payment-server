@@ -1420,6 +1420,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
+        "staging_auth_diagnostic_build": "2026-10-22-auth-trace-01",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2422,8 +2423,12 @@ def _auth_send_resend(email, code, challenge_uuid, opener=None):
         result = json.loads(data.decode("utf-8"))
         if not isinstance(result, dict) or not re.fullmatch(r"[a-zA-Z0-9-]{10,100}", str(result.get("id", ""))):
             raise RuntimeError("Resend provider returned no valid accepted email id")
-    except (_ResendHTTPError, _ResendURLError, TimeoutError, ValueError, UnicodeError) as exc:
-        # Never log/echo provider raw responses, full headers, API key or code.
+    except _ResendHTTPError as exc:
+        # HTTP status ONLY - never log provider text, API key, email, OTP or headers.
+        app.logger.error("STAGING_AUTH_TRACE stage=resend_http status=%s", int(exc.code))
+        raise RuntimeError("Resend API acceptance was not confirmed") from None
+    except (_ResendURLError, TimeoutError, ValueError, UnicodeError) as exc:
+        app.logger.error("STAGING_AUTH_TRACE stage=resend_transport exception=%s", type(exc).__name__)
         raise RuntimeError("Resend API acceptance was not confirmed") from None
     return True
 
@@ -2507,16 +2512,19 @@ def _auth_rate_allow(cur, email):
 @app.route("/customer/auth/request-code", methods=["POST"])
 def customer_auth_request_code():
     if not _auth_ready(require_email=True):
+        app.logger.warning("STAGING_AUTH_TRACE stage=request status=not_ready")
         return _auth_json_error(503, "STAGING email sign-in is not enabled or configured.")
     payload, error = require_json_payload()
     if error or not isinstance(payload, dict):
         return _auth_json_error(400, "Invalid JSON payload.")
     email = _auth_email(payload.get("email", ""))
     if not email:
+        app.logger.info("STAGING_AUTH_TRACE stage=request status=invalid_email")
         return _auth_json_error(400, "Valid email is required.")
     # Non-allowlisted pilot mailboxes receive the same accepted response as
     # normal requests, but no code is generated or sent.
     if not _auth_email_allowlisted(email):
+        app.logger.info("STAGING_AUTH_TRACE stage=request status=suppressed_not_allowlisted")
         return jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION}), 202
     # This identical response intentionally discloses no account existence.
     accepted = jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION})
@@ -2530,13 +2538,16 @@ def customer_auth_request_code():
         _auth_lock_request(cur, email)
         if not _auth_rate_allow(cur, email):
             conn.commit()
+            app.logger.info("STAGING_AUTH_TRACE stage=request status=suppressed_rate_limited")
             return accepted, 202
         cur.execute(f"INSERT INTO customer_auth_challenges (challenge_uuid,email,code_hash,created_at,expires_at,attempts,consumed_at,send_status) VALUES ({params(8)})",
                     (challenge_uuid, email, _auth_hmac("code:" + challenge_uuid, code), now.isoformat(),
                      (now + _AUTH_CHALLENGE_LIFETIME).isoformat(), 0, "", "PENDING"))
         conn.commit()
-    except Exception:
+        app.logger.info("STAGING_AUTH_TRACE stage=request status=challenge_saved")
+    except Exception as exc:
         conn.rollback()
+        app.logger.error("STAGING_AUTH_TRACE stage=request status=database_failure exception=%s", type(exc).__name__)
         app.logger.error("STAGING auth request failed before sending (details withheld)")
         return _auth_json_error(503, "Authentication service is temporarily unavailable.")
     finally:
@@ -2544,8 +2555,10 @@ def customer_auth_request_code():
 
     try:
         _auth_send_mail(email, code, challenge_uuid=challenge_uuid)
+        app.logger.info("STAGING_AUTH_TRACE stage=provider status=accepted")
     except Exception as exc:
         # Never log passwords, codes, message bodies, or SMTP raw responses.
+        app.logger.error("STAGING_AUTH_TRACE stage=provider status=not_confirmed exception=%s", type(exc).__name__)
         app.logger.error("STAGING auth email not confirmed: %s", type(exc).__name__)
         conn = get_db_connection()
         try:
@@ -2563,6 +2576,7 @@ def customer_auth_request_code():
         conn.commit()
     finally:
         conn.close()
+    app.logger.info("STAGING_AUTH_TRACE stage=request status=challenge_marked_sent")
     return accepted, 202
 
 
