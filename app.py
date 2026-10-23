@@ -1420,7 +1420,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-10-22-auth-trace-01",
+        "staging_auth_diagnostic_build": "2026-10-22-resend-cause-02",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2380,6 +2380,24 @@ def _resend_https_open(req, timeout=20):
     return _resend_build_opener(_NoResendRedirects()).open(req, timeout=timeout)
 
 
+class _ResendDeliveryDiagnostic(Exception):
+    """Only nonsecret failure categories; never retain HTTP response bodies or headers."""
+    def __init__(self, category, http_status=None, exception_type=None):
+        super().__init__(category)
+        self.category = category
+        self.http_status = http_status
+        self.exception_type = exception_type
+
+
+def _resend_safe_exception_type(exc):
+    # urllib often wraps the real reason in URLError.reason; type names only.
+    inner = getattr(exc, "reason", None)
+    typ = type(inner).__name__ if inner is not None else type(exc).__name__
+    return typ if typ in {"TimeoutError", "SSLError", "gaierror", "ConnectionRefusedError",
+                          "ConnectionResetError", "BrokenPipeError", "URLError",
+                          "PermissionError", "ConnectionAbortedError"} else "OtherNetworkError"
+
+
 def _auth_send_resend(email, code, challenge_uuid, opener=None):
     settings = _auth_resend_settings()
     if not settings:
@@ -2418,18 +2436,24 @@ def _auth_send_resend(email, code, challenge_uuid, opener=None):
         with (opener or _resend_https_open)(request, timeout=20) as response:
             status = int(response.status)
             data = response.read(16385)
-        if status not in (200, 201) or len(data) > 16384:
-            raise RuntimeError("Resend provider did not confirm API acceptance")
-        result = json.loads(data.decode("utf-8"))
+        if status not in (200, 201):
+            raise _ResendDeliveryDiagnostic("resend_unexpected_http_status", http_status=status)
+        if len(data) > 16384:
+            raise _ResendDeliveryDiagnostic("resend_response_too_large")
+        try:
+            result = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise _ResendDeliveryDiagnostic("resend_invalid_json") from None
         if not isinstance(result, dict) or not re.fullmatch(r"[a-zA-Z0-9-]{10,100}", str(result.get("id", ""))):
-            raise RuntimeError("Resend provider returned no valid accepted email id")
+            raise _ResendDeliveryDiagnostic("resend_missing_acceptance_id")
     except _ResendHTTPError as exc:
-        # HTTP status ONLY - never log provider text, API key, email, OTP or headers.
+        # Only HTTP status is retained; never provider text, key, email, OTP, headers.
         app.logger.error("STAGING_AUTH_TRACE stage=resend_http status=%s", int(exc.code))
-        raise RuntimeError("Resend API acceptance was not confirmed") from None
-    except (_ResendURLError, TimeoutError, ValueError, UnicodeError) as exc:
-        app.logger.error("STAGING_AUTH_TRACE stage=resend_transport exception=%s", type(exc).__name__)
-        raise RuntimeError("Resend API acceptance was not confirmed") from None
+        raise _ResendDeliveryDiagnostic("resend_http_rejected", http_status=int(exc.code)) from None
+    except (_ResendURLError, TimeoutError, UnicodeError, OSError) as exc:
+        safe_type = _resend_safe_exception_type(exc)
+        app.logger.error("STAGING_AUTH_TRACE stage=resend_transport type=%s", safe_type)
+        raise _ResendDeliveryDiagnostic("resend_transport_failure", exception_type=safe_type) from None
     return True
 
 def _auth_ready(require_email=False):
@@ -2567,7 +2591,20 @@ def customer_auth_request_code():
             conn.commit()
         finally:
             conn.close()
-        return _auth_json_error(503, "Verification email could not be confirmed. Please try later.")
+        # STAGING ONLY: expose a constrained diagnostic category in the error response,
+        # avoiding Render log access. Never include exception text, recipient, OTP,
+        # provider response bodies or headers, API key, HMAC, or DB identifiers.
+        diagnosis = {"category": "email_provider_unclassified"}
+        if isinstance(exc, _ResendDeliveryDiagnostic):
+            diagnosis = {"category": exc.category}
+            if exc.http_status is not None:
+                diagnosis["http_status"] = exc.http_status
+            if exc.exception_type is not None:
+                diagnosis["network_exception_type"] = exc.exception_type
+        return jsonify({"ok": False,
+                        "error": "Verification email could not be confirmed. Please try later.",
+                        "version": APP_VERSION,
+                        "staging_email_diagnostic": diagnosis}), 503
 
     conn = get_db_connection()
     try:
