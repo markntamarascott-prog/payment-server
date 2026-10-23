@@ -1420,7 +1420,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-10-22-resend-cause-02",
+        "staging_auth_diagnostic_build": "2026-10-22-resend-reason-03",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2382,11 +2382,12 @@ def _resend_https_open(req, timeout=20):
 
 class _ResendDeliveryDiagnostic(Exception):
     """Only nonsecret failure categories; never retain HTTP response bodies or headers."""
-    def __init__(self, category, http_status=None, exception_type=None):
+    def __init__(self, category, http_status=None, exception_type=None, reason_code=None):
         super().__init__(category)
         self.category = category
         self.http_status = http_status
         self.exception_type = exception_type
+        self.reason_code = reason_code
 
 
 def _resend_safe_exception_type(exc):
@@ -2396,6 +2397,47 @@ def _resend_safe_exception_type(exc):
     return typ if typ in {"TimeoutError", "SSLError", "gaierror", "ConnectionRefusedError",
                           "ConnectionResetError", "BrokenPipeError", "URLError",
                           "PermissionError", "ConnectionAbortedError"} else "OtherNetworkError"
+
+
+def _resend_403_reason_code(http_error):
+    """Classify a Resend 403 without returning or logging provider-supplied text.
+
+    Provider response bodies may contain account or recipient details. They are
+    held only in process memory for this classification and never persisted.
+    """
+    try:
+        raw = http_error.read(4097)
+        if len(raw) > 4096:
+            return "provider_error_body_oversized"
+        detail = json.loads(raw.decode("utf-8"))
+        if not isinstance(detail, dict):
+            return "provider_error_not_object"
+        name = detail.get("name", "")
+        message = detail.get("message", "")
+        if not isinstance(name, str) or not isinstance(message, str):
+            return "provider_error_unexpected_fields"
+        name = name[:80].lower().strip()
+        message = message[:1200].lower()
+        if name == "suspended_api_key" or "api key is suspended" in message:
+            return "api_key_suspended"
+        if name == "restricted_api_key" or "api key is not active" in message:
+            return "api_key_not_active"
+        if name == "invalid_permission" or "missing required scopes" in message:
+            return "insufficient_api_permissions"
+        if "only send testing emails" in message or "send testing emails to your own" in message:
+            return "testing_recipient_restriction"
+        if "domain is not verified" in message or "domain not verified" in message:
+            return "sender_domain_not_verified"
+        if name == "validation_error":
+            return "provider_validation_other"
+        return "provider_403_other"
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return "provider_error_unreadable"
+    finally:
+        try:
+            http_error.close()
+        except Exception:
+            pass
 
 
 def _auth_send_resend(email, code, challenge_uuid, opener=None):
@@ -2447,9 +2489,14 @@ def _auth_send_resend(email, code, challenge_uuid, opener=None):
         if not isinstance(result, dict) or not re.fullmatch(r"[a-zA-Z0-9-]{10,100}", str(result.get("id", ""))):
             raise _ResendDeliveryDiagnostic("resend_missing_acceptance_id")
     except _ResendHTTPError as exc:
-        # Only HTTP status is retained; never provider text, key, email, OTP, headers.
-        app.logger.error("STAGING_AUTH_TRACE stage=resend_http status=%s", int(exc.code))
-        raise _ResendDeliveryDiagnostic("resend_http_rejected", http_status=int(exc.code)) from None
+        # The provider's raw response is NEVER logged or sent to the desktop.
+        # 403 receives a bounded, allowlisted reason code for diagnostic use.
+        status = int(exc.code)
+        reason_code = _resend_403_reason_code(exc) if status == 403 else None
+        app.logger.error("STAGING_AUTH_TRACE stage=resend_http status=%s reason=%s",
+                         status, reason_code or "not_classified")
+        raise _ResendDeliveryDiagnostic("resend_http_rejected", http_status=status,
+                                        reason_code=reason_code) from None
     except (_ResendURLError, TimeoutError, UnicodeError, OSError) as exc:
         safe_type = _resend_safe_exception_type(exc)
         app.logger.error("STAGING_AUTH_TRACE stage=resend_transport type=%s", safe_type)
@@ -2601,6 +2648,8 @@ def customer_auth_request_code():
                 diagnosis["http_status"] = exc.http_status
             if exc.exception_type is not None:
                 diagnosis["network_exception_type"] = exc.exception_type
+            if exc.reason_code is not None:
+                diagnosis["provider_reason_code"] = exc.reason_code
         return jsonify({"ok": False,
                         "error": "Verification email could not be confirmed. Please try later.",
                         "version": APP_VERSION,
