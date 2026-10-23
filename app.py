@@ -1420,7 +1420,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-10-22-resend-reason-03",
+        "staging_auth_diagnostic_build": "2026-10-23-resend-user-agent-04",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2467,6 +2467,7 @@ def _auth_send_resend(email, code, challenge_uuid, opener=None):
         headers={
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
+            "User-Agent": "shiptaxrefund-staging/1.0",
             "Idempotency-Key": "shiptaxrefund-staging-login-" + challenge_uuid,
         },
         method="POST",
