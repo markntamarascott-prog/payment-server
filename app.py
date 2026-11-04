@@ -1,7 +1,7 @@
-# ShipTaxRefund Gate13 - proof-readiness guard FULL source OFFLINE preview.
-# DO NOT DEPLOY to Render or run as a customer installation.
-# Compared against archived Gate6 full backend; redact unexpected errors only.
-# 2026-10-25-receipt-quarantine-fail-closed-offline-preview-06
+# ShipTaxRefund Yahoo pilot STAGING candidate.
+# Real Amazon sending remains disabled; pilot is OFF by default.
+# No additional schema migration. Preserve protected runtime permissions.
+# 2026-11-03-yahoo-pilot-staging-01
 import hashlib
 import hmac
 import secrets
@@ -1590,7 +1590,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-10-25-submission-manager-session-gate-preview-05",
+        "staging_auth_diagnostic_build": "2026-11-03-yahoo-pilot-staging-01",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2508,7 +2508,7 @@ def _submission_authorize(payload):
 
     No email-driven customer creation; submitted shopping email stays a separate
     profile identifier and cannot be used to claim cloud ownership.
-    This is a NON-DEPLOYABLE staging preview: divergent emails need reviewed
+    In this staging service, divergent emails need reviewed
     account linking, and old clients without a cloud bearer intentionally fail.
     """
     customer, reason, status = _verified_entitled_customer(payload)
@@ -2853,6 +2853,27 @@ def submission_manager_register():
                 # Immutable after the sending process begins.
                 conn.commit()
                 return jsonify({'ok':True,'packet_uuid':old['packet_uuid'],'status':old['status'],'already_registered':True,'version':APP_VERSION})
+            # An exact repeated registration must not erase a reviewed packet's
+            # readiness. Recheck the server-owned review under the existing lock;
+            # never trust the caller's proof_status or a matching PDF alone.
+            if old and old['status'] == 'READY_TO_SEND':
+                fields = ('packet_type', 'invoice_reference', 'file_name',
+                          'file_sha256', 'requested_total')
+                same_metadata = all(str(old[key]) == str(item[key]) for key in fields)
+                current_orders, _ = _proof_orders_snapshot(cur, old)
+                same_orders = sorted((row['amazon_order_id'], row['requested_tax'])
+                                     for row in current_orders) == sorted(item['orders'])
+                if same_metadata and same_orders:
+                    try:
+                        _proof_require_approved(cur, old)
+                    except RuntimeError:
+                        # Missing/stale/revoked reviewer authority requires review.
+                        pass
+                    else:
+                        conn.commit()
+                        return jsonify({'ok': True, 'packet_uuid': old['packet_uuid'],
+                                        'status': 'READY_TO_SEND', 'already_registered': True,
+                                        'version': APP_VERSION})
             packet_uuid = old['packet_uuid'] if old else str(uuid.uuid4())
             if old:
                 cur.execute(
@@ -2942,6 +2963,198 @@ def submission_manager_begin_send():
     except Exception as exc:return _submission_endpoint_errors(exc)
 
 
+"""Yahoo pilot adapter: no credentials persisted and no automatic resend."""
+_YAHOO_PILOT_MAX_PDF = 5 * 1024 * 1024
+_YAHOO_PILOT_MAX_REQUEST = 8 * 1024 * 1024
+_YAHOO_SMTP_FACTORY = smtplib.SMTP_SSL
+
+
+def _yahoo_pilot_event(cur, packet_uuid, event_type, details):
+    allowed = {key: details[key] for key in ('send_attempt_id', 'file_sha256',
+               'orders_sha256', 'smtp_data_code', 'server_message_id') if key in details}
+    cur.execute(f"INSERT INTO customer_submission_events (event_id,packet_uuid,event_type,event_at,details_json) VALUES ({params(5)})",
+                (str(uuid.uuid4()), packet_uuid, event_type, utc_now_iso(), json.dumps(allowed, sort_keys=True)))
+
+
+def _yahoo_pilot_accept(sender, app_password, recipient, message):
+    """Observe TLS SMTP acceptance directly. Never retry or expose provider errors."""
+    import ssl
+    import time
+    from email import policy
+    deadline = time.monotonic() + 45
+    smtp = None
+    accepted = False
+    try:
+        smtp = _YAHOO_SMTP_FACTORY('smtp.mail.yahoo.com', 465, timeout=10,
+                                   context=ssl.create_default_context())
+        def budget():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Yahoo pilot time budget exhausted')
+            sock = getattr(smtp, 'sock', None)
+            if sock is not None:
+                sock.settimeout(min(10, remaining))
+        budget()
+        code, _ = smtp.ehlo()
+        if code != 250:
+            return False
+        budget()
+        smtp.login(sender, app_password)
+        budget()
+        code, _ = smtp.mail(sender)
+        if code != 250:
+            return False
+        budget()
+        code, _ = smtp.rcpt(recipient)
+        if code not in (250, 251):
+            return False
+        budget()
+        code, _ = smtp.data(message.as_bytes(policy=policy.SMTP))
+        accepted = code == 250
+    except Exception:
+        # Provider exceptions can contain credentials or message data. Never log.
+        accepted = False
+    finally:
+        if smtp is not None:
+            try:
+                sock = getattr(smtp, 'sock', None)
+                if sock is not None:
+                    sock.settimeout(2)
+                smtp.quit()
+            except Exception:
+                pass  # QUIT failure cannot undo a recorded DATA 250 observation.
+            try:
+                smtp.close()
+            except Exception:
+                pass
+    return accepted
+
+
+@app.route('/customer/submission-manager/yahoo-pilot-send', methods=['POST'])
+def submission_manager_yahoo_pilot_send():
+    """OFF by default. Reviewed synthetic pilot only, never an Amazon recipient."""
+    if not (APP_VERSION.endswith('-STAGING') and
+            os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected' and
+            safe_bool(os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_ENABLED', ''))):
+        return jsonify(ok=False, error='Yahoo pilot sending is disabled.'), 503
+    if request.content_length is None or request.content_length > _YAHOO_PILOT_MAX_REQUEST:
+        return jsonify(ok=False, error='A bounded PDF request is required.'), 413
+    payload, error = require_json_payload()
+    if error:
+        return jsonify(ok=False, error=error), 400
+    password = payload.pop('yahoo_app_password', None)
+    pdf = None
+    message = None
+    try:
+        import base64
+        from email.utils import make_msgid
+        if not isinstance(password, str) or not 1 <= len(password) <= 256:
+            raise ValueError('Yahoo app password is required for this send only.')
+        if payload.get('credential_use_consent') != 'USE_ONCE_FOR_YAHOO_PILOT_SEND':
+            raise PermissionError('Explicit one-send credential consent is required.')
+        customer_uuid, _ = _submission_authorize(payload)
+        sender = _auth_email(payload.get('sender_email'))
+        recipient = _auth_email(payload.get('recipient_email'))
+        allowed_senders = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
+        allowed_recipients = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
+        if not sender or sender not in allowed_senders or not sender.endswith('@yahoo.com'):
+            raise PermissionError('Sender is not an approved Yahoo pilot mailbox.')
+        domain = recipient.rsplit('@', 1)[-1] if recipient else ''
+        if not recipient or recipient not in allowed_recipients or 'amazon' in domain:
+            raise PermissionError('Only approved non-Amazon pilot recipients are permitted.')
+        encoded = payload.pop('pdf_base64', None)
+        if not isinstance(encoded, str) or len(encoded) > ((_YAHOO_PILOT_MAX_PDF + 2) // 3) * 4:
+            raise ValueError('A PDF within the pilot size limit is required.')
+        try:
+            pdf = base64.b64decode(encoded, validate=True)
+        except Exception:
+            raise ValueError('PDF encoding is invalid.') from None
+        encoded = None
+        if not pdf.startswith(b'%PDF-') or len(pdf) > _YAHOO_PILOT_MAX_PDF:
+            raise ValueError('A PDF within the pilot size limit is required.')
+        file_hash = hashlib.sha256(pdf).hexdigest()
+        packet_uuid = clean_text(payload.get('packet_uuid', ''), 120)
+        if not packet_uuid:
+            raise ValueError('Reviewed packet is required.')
+        _verify_runtime_schema()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (customer_uuid,))
+            packet = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
+            if not str(packet['packet_id']).startswith('YAHOO-PILOT-'):
+                raise PermissionError('Use a separately prepared Yahoo pilot packet, not a real refund packet.')
+            if packet['status'] != 'READY_TO_SEND':
+                raise RuntimeError('Packet is not ready for a new send. Review existing attempts before continuing.')
+            if packet['file_sha256'] != file_hash:
+                raise RuntimeError('PDF changed after review.')
+            if normalize_email(packet['amazon_account_email']) != sender:
+                raise PermissionError('Yahoo sender must match the reviewed account profile.')
+            _proof_require_approved(cur, packet)
+            if _submission_locked_order_conflict(cur, packet):
+                raise RuntimeError('An order already has an active or sent packet.')
+            orders, orders_hash = _proof_orders_snapshot(cur, packet)
+            # Build the message from reviewed server data, not arbitrary client MIME.
+            message = EmailMessage()
+            message['From'] = sender
+            message['To'] = recipient
+            message['Subject'] = 'ShipTaxRefund TEST ONLY - ' + packet['packet_id']
+            message['Message-ID'] = make_msgid(domain='shiptaxrefund.invalid')
+            lines = ['TEST ONLY. No Amazon request is being submitted.', '', 'Reviewed orders:']
+            lines.extend(row['amazon_order_id'] + ' | ' + row['requested_tax'] for row in orders)
+            lines.extend(['', 'Total: ' + packet['requested_total']])
+            message.set_content('\n'.join(lines))
+            message.add_attachment(pdf, maintype='application', subtype='pdf', filename='reviewed-pilot.pdf')
+            attempt_id = str(uuid.uuid4())
+            now = utc_now_iso()
+            cur.execute(f"UPDATE customer_submission_packets SET status='SEND_IN_PROGRESS',send_attempt_id={param()},attempted_at={param()},sender_email={param()},recipient_email={param()},mail_provider='yahoo_smtp',updated_at={param()} WHERE packet_uuid={param()}",
+                        (attempt_id, now, sender, recipient, now, packet_uuid))
+            _yahoo_pilot_event(cur, packet_uuid, 'YAHOO_PILOT_RESERVED',
+                              {'send_attempt_id': attempt_id, 'file_sha256': file_hash, 'orders_sha256': orders_hash})
+            conn.commit()  # Durable reservation before any SMTP IO.
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        accepted = _yahoo_pilot_accept(sender, password, recipient, message)
+        password = None
+        status = 'SENT' if accepted else 'SEND_UNCERTAIN'
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            current = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
+            if current['send_attempt_id'] != attempt_id or current['status'] != 'SEND_IN_PROGRESS':
+                raise RuntimeError('Send reservation changed; reconciliation required.')
+            cur.execute(f'UPDATE customer_submission_packets SET status={param()},updated_at={param()} WHERE packet_uuid={param()}',
+                        (status, utc_now_iso(), packet_uuid))
+            _yahoo_pilot_event(cur, packet_uuid, 'YAHOO_PILOT_ACCEPTED' if accepted else 'YAHOO_PILOT_UNCERTAIN',
+                              {'send_attempt_id': attempt_id, 'smtp_data_code': 250 if accepted else None,
+                               'server_message_id': str(message['Message-ID']),
+                               'file_sha256': file_hash, 'orders_sha256': orders_hash})
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            return jsonify(ok=False, status='SEND_UNCERTAIN', provider_confirmed=False,
+                           error='Send outcome could not be recorded. Do not resend; reconciliation is required.'), 202
+        finally:
+            conn.close()
+        return jsonify(ok=accepted, status=status, packet_uuid=packet_uuid,
+                       send_attempt_id=attempt_id, provider_confirmed=accepted,
+                       delivery_confirmed=False, pilot_only=True), 200 if accepted else 202
+    except (_SubmissionAuthorizationFailure, PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        return _submission_endpoint_errors(exc)
+    except Exception:
+        # Do not emit a traceback for a request carrying a transient credential.
+        return jsonify(ok=False, error='Yahoo pilot operation could not be confirmed. Do not resend automatically.'), 503
+    finally:
+        password = None
+        pdf = None
+        message = None
+        # Python cannot guarantee immediate memory erasure of immutable strings.
+        # No credential or PDF bytes are written to storage or audit records.
+
+
 @app.route('/customer/submission-manager/confirm-sent', methods=['POST'])
 def submission_manager_confirm_sent():
     """Gate6 FAIL-CLOSED preview: no client claim may set a packet SENT.
@@ -2949,9 +3162,9 @@ def submission_manager_confirm_sent():
     This endpoint deliberately leaves a send unconfirmed because the actual
     backend cannot independently verify Yahoo SMTP acceptance, a Gmail API
     response, or a Microsoft Graph response from an arbitrary client payload.
-    The existing desktop is NOT compatible with a 202 unverified response.
-    This preview is NEVER DEPLOYABLE until a trusted provider verifier and
-    compatible desktop UX are independently implemented and tested.
+    This legacy client-confirmation route never certifies provider acceptance.
+    The separate Yahoo pilot route observes SMTP itself and remains disabled
+    until explicitly configured for reviewed test packets.
     """
     payload, error = require_json_payload()
     if error:
