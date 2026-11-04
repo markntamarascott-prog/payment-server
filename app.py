@@ -1,7 +1,7 @@
 # ShipTaxRefund Yahoo pilot STAGING candidate.
 # Real Amazon sending remains disabled; pilot is OFF by default.
 # No additional schema migration. Preserve protected runtime permissions.
-# 2026-11-03-yahoo-pilot-staging-01
+# 2026-11-04-yahoo-own-account-test-01
 import hashlib
 import hmac
 import secrets
@@ -1590,7 +1590,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-11-03-yahoo-pilot-staging-01",
+        "staging_auth_diagnostic_build": "2026-11-04-yahoo-own-account-test-01",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2964,6 +2964,8 @@ def submission_manager_begin_send():
 
 
 """Yahoo pilot adapter: no credentials persisted and no automatic resend."""
+# Only the bundled fictional attachment may use the self-test flow.
+_YAHOO_PILOT_TEST_FIXTURES = {'YAHOO-PILOT-20261103-001': {'file_sha256': 'e958a65725e02047b3b39a326539018e5986fdb5ed092abc7e9843457c99bbff', 'orders_sha256': 'c03414e87b95db96cc4cec3599b46fcb368fe03ec9d610ba952e189d857926da', 'requested_total': '0.01'}}
 _YAHOO_PILOT_MAX_PDF = 5 * 1024 * 1024
 _YAHOO_PILOT_MAX_REQUEST = 8 * 1024 * 1024
 _YAHOO_SMTP_FACTORY = smtplib.SMTP_SSL
@@ -3084,27 +3086,35 @@ def submission_manager_yahoo_pilot_send():
             packet = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
             if not str(packet['packet_id']).startswith('YAHOO-PILOT-'):
                 raise PermissionError('Use a separately prepared Yahoo pilot packet, not a real refund packet.')
-            if packet['status'] != 'READY_TO_SEND':
+            if packet['status'] not in ('NEEDS_PROOF_REVIEW', 'READY_TO_SEND'):
                 raise RuntimeError('Packet is not ready for a new send. Review existing attempts before continuing.')
             if packet['file_sha256'] != file_hash:
                 raise RuntimeError('PDF changed after review.')
             if normalize_email(packet['amazon_account_email']) != sender:
                 raise PermissionError('Yahoo sender must match the reviewed account profile.')
-            _proof_require_approved(cur, packet)
+            # Email transport test, not a real-document approval. No reviewer
+            # identity or approval is created. Ordinary refund sends retain their
+            # existing independent proof-review guard.
+            orders, orders_hash = _proof_orders_snapshot(cur, packet)
+            fixture = _YAHOO_PILOT_TEST_FIXTURES.get(packet['packet_id'])
+            if (payload.get('pilot_test_acknowledgement') != 'FICTIONAL_ATTACHMENT_TEST_ONLY' or
+                    not fixture or fixture['file_sha256'] != file_hash or
+                    fixture['orders_sha256'] != orders_hash or
+                    fixture['requested_total'] != str(packet['requested_total'])):
+                raise PermissionError('Only the exact bundled fictional test packet is permitted.')
             if _submission_locked_order_conflict(cur, packet):
                 raise RuntimeError('An order already has an active or sent packet.')
-            orders, orders_hash = _proof_orders_snapshot(cur, packet)
             # Build the message from reviewed server data, not arbitrary client MIME.
             message = EmailMessage()
             message['From'] = sender
             message['To'] = recipient
             message['Subject'] = 'ShipTaxRefund TEST ONLY - ' + packet['packet_id']
             message['Message-ID'] = make_msgid(domain='shiptaxrefund.invalid')
-            lines = ['TEST ONLY. No Amazon request is being submitted.', '', 'Reviewed orders:']
+            lines = ['TEST ONLY. No Amazon request is being submitted.', '', 'Fictional test orders:']
             lines.extend(row['amazon_order_id'] + ' | ' + row['requested_tax'] for row in orders)
             lines.extend(['', 'Total: ' + packet['requested_total']])
             message.set_content('\n'.join(lines))
-            message.add_attachment(pdf, maintype='application', subtype='pdf', filename='reviewed-pilot.pdf')
+            message.add_attachment(pdf, maintype='application', subtype='pdf', filename='fictional-email-test.pdf')
             attempt_id = str(uuid.uuid4())
             now = utc_now_iso()
             cur.execute(f"UPDATE customer_submission_packets SET status='SEND_IN_PROGRESS',send_attempt_id={param()},attempted_at={param()},sender_email={param()},recipient_email={param()},mail_provider='yahoo_smtp',updated_at={param()} WHERE packet_uuid={param()}",
