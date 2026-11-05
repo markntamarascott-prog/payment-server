@@ -1,7 +1,7 @@
 # ShipTaxRefund Yahoo pilot STAGING candidate.
 # Real Amazon sending remains disabled; pilot is OFF by default.
 # No additional schema migration. Preserve protected runtime permissions.
-# 2026-11-04-yahoo-own-account-test-01
+# 2026-11-04-yahoo-own-account-test-02
 import hashlib
 import hmac
 import secrets
@@ -1590,7 +1590,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-11-04-yahoo-own-account-test-01",
+        "staging_auth_diagnostic_build": "2026-11-04-yahoo-own-account-test-02",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2966,6 +2966,7 @@ def submission_manager_begin_send():
 """Yahoo pilot adapter: no credentials persisted and no automatic resend."""
 # Only the bundled fictional attachment may use the self-test flow.
 _YAHOO_PILOT_TEST_FIXTURES = {'YAHOO-PILOT-20261103-001': {'file_sha256': 'e958a65725e02047b3b39a326539018e5986fdb5ed092abc7e9843457c99bbff', 'orders_sha256': 'c03414e87b95db96cc4cec3599b46fcb368fe03ec9d610ba952e189d857926da', 'requested_total': '0.01'}}
+_YAHOO_PILOT_BUNDLED_PACKET = {'packet_id': 'YAHOO-PILOT-20261103-001', 'packet_type': 'MAX_INVOICE', 'invoice_reference': 'FICTIONAL-TEST-NO-INVOICE', 'file_name': 'ShipTaxRefund_Yahoo_Pilot_Test.pdf', 'file_sha256': 'e958a65725e02047b3b39a326539018e5986fdb5ed092abc7e9843457c99bbff', 'profile_key': 'YAHOO-PILOT-20261103-001', 'forwarder': 'max', 'requested_total': '0.01', 'orders': [{'amazon_order_id': '999-0000000-0000001', 'requested_tax': '0.01'}]}
 _YAHOO_PILOT_MAX_PDF = 5 * 1024 * 1024
 _YAHOO_PILOT_MAX_REQUEST = 8 * 1024 * 1024
 _YAHOO_SMTP_FACTORY = smtplib.SMTP_SSL
@@ -3032,6 +3033,74 @@ def _yahoo_pilot_accept(sender, app_password, recipient, message):
     return accepted
 
 
+def _yahoo_pilot_test_customer(payload):
+    """Verified test-inbox owner, not a paid refund entitlement or reviewer."""
+    if not (APP_VERSION.endswith('-STAGING') and _auth_ready() and
+            os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected'):
+        raise _SubmissionAuthorizationFailure('Staging email testing is unavailable.', 503)
+    _verify_runtime_schema()
+    principal = _auth_current_customer()
+    if not principal:
+        raise _SubmissionAuthorizationFailure('Sign in before preparing an email test.', 401)
+    email = normalize_email(principal.get('email', ''))
+    allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
+    if not any(allowed):
+        raise _SubmissionAuthorizationFailure('Test mailboxes have not been configured.', 503)
+    if email not in allowed or (payload.get('email') and normalize_email(payload['email']) != email):
+        raise _SubmissionAuthorizationFailure('This sign-in is not an approved test inbox.', 403)
+    claimed = payload.get('customer_uuid') or payload.get('owner_customer_uuid')
+    if claimed and claimed != principal['customer_uuid']:
+        raise _SubmissionAuthorizationFailure('The test must belong to this sign-in.', 403)
+    return principal['customer_uuid'], email
+
+
+@app.route('/customer/submission-manager/yahoo-pilot-prepare', methods=['POST'])
+def submission_manager_yahoo_pilot_prepare():
+    """Prepare the server-pinned fictional packet. Never send or approve proof."""
+    if request.content_length is None or request.content_length > 4096:
+        return jsonify(ok=False, error='A bounded test-preparation request is required.'), 413
+    payload, error = require_json_payload()
+    if error:
+        return jsonify(ok=False, error=error), 400
+    try:
+        customer_uuid, _ = _yahoo_pilot_test_customer(payload)
+        sender = _auth_email(payload.get('sender_email'))
+        allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
+        if not sender or not sender.endswith('@yahoo.com') or sender not in allowed:
+            raise PermissionError('Choose the approved Yahoo test sender.')
+        item = _submission_validate_registration(dict(_YAHOO_PILOT_BUNDLED_PACKET, amazon_account_email=sender))
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (customer_uuid,))
+            cur.execute(f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND forwarder={param()} AND profile_key={param()} AND packet_id={param()} FOR UPDATE',
+                        (customer_uuid, item['forwarder'], item['profile_key'], item['packet_id']))
+            old = _submission_row(cur, cur.fetchone())
+            if old:
+                if normalize_email(old['amazon_account_email']) != sender:
+                    raise PermissionError('The existing test belongs to a different Yahoo profile.')
+                _, orders_hash = _proof_orders_snapshot(cur, old)
+                fixture = _YAHOO_PILOT_TEST_FIXTURES[item['packet_id']]
+                if old['file_sha256'] != fixture['file_sha256'] or orders_hash != fixture['orders_sha256']:
+                    raise RuntimeError('Existing test data changed. Do not overwrite it or resend.')
+                conn.commit()
+                return jsonify(ok=True, packet_uuid=old['packet_uuid'], status=old['status'], already_registered=True)
+            uid = str(uuid.uuid4()); now = utc_now_iso()
+            cur.execute(f'INSERT INTO customer_submission_packets (packet_uuid,customer_uuid,forwarder,profile_key,amazon_account_email,packet_id,packet_type,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at) VALUES ({params(14)})',
+                        (uid,customer_uuid,item['forwarder'],item['profile_key'],sender,item['packet_id'],item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],'NEEDS_PROOF_REVIEW',now,now))
+            for order_id, amount in item['orders']:
+                cur.execute(f'INSERT INTO customer_submission_packet_orders (packet_uuid,amazon_order_id,requested_tax) VALUES ({params(3)})',(uid,order_id,amount))
+            _yahoo_pilot_event(cur,uid,'YAHOO_PILOT_PREPARED',{'file_sha256':item['file_sha256']})
+            conn.commit()
+            return jsonify(ok=True,packet_uuid=uid,status='NEEDS_PROOF_REVIEW',already_registered=False)
+        except Exception:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        return _submission_endpoint_errors(exc)
+
+
 @app.route('/customer/submission-manager/yahoo-pilot-send', methods=['POST'])
 def submission_manager_yahoo_pilot_send():
     """OFF by default. Reviewed synthetic pilot only, never an Amazon recipient."""
@@ -3054,13 +3123,15 @@ def submission_manager_yahoo_pilot_send():
             raise ValueError('Yahoo app password is required for this send only.')
         if payload.get('credential_use_consent') != 'USE_ONCE_FOR_YAHOO_PILOT_SEND':
             raise PermissionError('Explicit one-send credential consent is required.')
-        customer_uuid, _ = _submission_authorize(payload)
+        customer_uuid, owner_email = _yahoo_pilot_test_customer(payload)
         sender = _auth_email(payload.get('sender_email'))
         recipient = _auth_email(payload.get('recipient_email'))
         allowed_senders = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
         allowed_recipients = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
         if not sender or sender not in allowed_senders or not sender.endswith('@yahoo.com'):
             raise PermissionError('Sender is not an approved Yahoo pilot mailbox.')
+        if recipient != owner_email:
+            raise PermissionError('Send this test only to your own signed-in inbox.')
         domain = recipient.rsplit('@', 1)[-1] if recipient else ''
         if not recipient or recipient not in allowed_recipients or 'amazon' in domain:
             raise PermissionError('Only approved non-Amazon pilot recipients are permitted.')
