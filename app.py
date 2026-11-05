@@ -1,7 +1,7 @@
 # ShipTaxRefund Yahoo pilot STAGING candidate.
 # Real Amazon sending remains disabled; pilot is OFF by default.
 # No additional schema migration. Preserve protected runtime permissions.
-# 2026-11-05-gmail-own-account-test-01
+# 2026-11-05-icloud-own-account-test-01
 import hashlib
 import hmac
 import secrets
@@ -1590,7 +1590,7 @@ def index():
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
         "staging_email_auth_enabled": _auth_enabled(),
-        "staging_auth_diagnostic_build": "2026-11-05-gmail-own-account-test-01",
+        "staging_auth_diagnostic_build": "2026-11-05-icloud-own-account-test-01",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -2974,6 +2974,12 @@ _GMAIL_PILOT_BUNDLED_PACKET = dict(_YAHOO_PILOT_BUNDLED_PACKET,
 _GMAIL_PILOT_FIXTURE = _YAHOO_PILOT_TEST_FIXTURES[_YAHOO_PILOT_BUNDLED_PACKET['packet_id']]
 _GMAIL_PILOT_SENDER = os.environ.get('SHIPTAXREFUND_STAGING_GMAIL_PILOT_SENDER', '').strip().lower()
 _GMAIL_PILOT_RECIPIENT = os.environ.get('SHIPTAXREFUND_STAGING_GMAIL_PILOT_RECIPIENT', '').strip().lower()
+_ICLOUD_PILOT_PACKET_ID = 'ICLOUD-PILOT-20261105-001'
+_ICLOUD_PILOT_BUNDLED_PACKET = dict(_YAHOO_PILOT_BUNDLED_PACKET,
+                                   packet_id=_ICLOUD_PILOT_PACKET_ID,
+                                   profile_key=_ICLOUD_PILOT_PACKET_ID)
+_ICLOUD_PILOT_SENDER = os.environ.get('SHIPTAXREFUND_STAGING_ICLOUD_PILOT_SENDER', '').strip().lower()
+_ICLOUD_PILOT_RECIPIENT = os.environ.get('SHIPTAXREFUND_STAGING_ICLOUD_PILOT_RECIPIENT', '').strip().lower()
 _YAHOO_PILOT_MAX_PDF = 5 * 1024 * 1024
 _YAHOO_PILOT_MAX_REQUEST = 8 * 1024 * 1024
 _YAHOO_SMTP_FACTORY = smtplib.SMTP_SSL
@@ -2986,7 +2992,7 @@ def _yahoo_pilot_event(cur, packet_uuid, event_type, details):
                 (str(uuid.uuid4()), packet_uuid, event_type, utc_now_iso(), json.dumps(allowed, sort_keys=True)))
 
 
-def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.mail.yahoo.com'):
+def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.mail.yahoo.com', starttls=False):
     """Observe TLS SMTP acceptance directly. Never retry or expose provider errors."""
     import ssl
     import time
@@ -2995,8 +3001,12 @@ def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.
     smtp = None
     accepted = False
     try:
-        smtp = _YAHOO_SMTP_FACTORY(host, 465, timeout=10,
-                                   context=ssl.create_default_context())
+        context = ssl.create_default_context()
+        if starttls:
+            smtp = smtplib.SMTP(host, 587, timeout=10)
+        else:
+            smtp = _YAHOO_SMTP_FACTORY(host, 465, timeout=10, context=context)
+
         def budget():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -3008,6 +3018,15 @@ def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.
         code, _ = smtp.ehlo()
         if code != 250:
             return False
+        if starttls:
+            budget()
+            code, _ = smtp.starttls(context=context)
+            if code != 220:
+                return False
+            budget()
+            code, _ = smtp.ehlo()
+            if code != 250:
+                return False
         budget()
         smtp.login(sender, app_password)
         budget()
@@ -3040,7 +3059,7 @@ def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.
     return accepted
 
 
-def _yahoo_pilot_test_customer(payload, *, gmail=False):
+def _yahoo_pilot_test_customer(payload, *, provider="Yahoo"):
     """Verified test-inbox owner, not a paid refund entitlement or reviewer."""
     if not (APP_VERSION.endswith('-STAGING') and _auth_ready() and
             os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected'):
@@ -3051,8 +3070,10 @@ def _yahoo_pilot_test_customer(payload, *, gmail=False):
         raise _SubmissionAuthorizationFailure('Sign in before preparing an email test.', 401)
     email = normalize_email(principal.get('email', ''))
     allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
-    if gmail:
+    if provider == 'Gmail':
         allowed = {_GMAIL_PILOT_SENDER}
+    elif provider == 'iCloud':
+        allowed = {_ICLOUD_PILOT_RECIPIENT}
     if not any(allowed):
         raise _SubmissionAuthorizationFailure('Test mailboxes have not been configured.', 503)
     if email not in allowed or (payload.get('email') and normalize_email(payload['email']) != email):
@@ -3070,10 +3091,15 @@ def submission_manager_yahoo_pilot_prepare():
 
 @app.route('/customer/submission-manager/gmail-pilot-prepare', methods=['POST'])
 def submission_manager_gmail_pilot_prepare():
-    return _prepare_email_pilot(gmail=True)
+    return _prepare_email_pilot(provider="Gmail")
 
 
-def _prepare_email_pilot(*, gmail=False):
+@app.route('/customer/submission-manager/icloud-pilot-prepare', methods=['POST'])
+def submission_manager_icloud_pilot_prepare():
+    return _prepare_email_pilot(provider='iCloud')
+
+
+def _prepare_email_pilot(*, provider="Yahoo"):
     """Prepare the server-pinned fictional packet. Never send or approve proof."""
     if request.content_length is None or request.content_length > 4096:
         return jsonify(ok=False, error='A bounded test-preparation request is required.'), 413
@@ -3081,10 +3107,15 @@ def _prepare_email_pilot(*, gmail=False):
     if error:
         return jsonify(ok=False, error=error), 400
     try:
-        customer_uuid, _ = _yahoo_pilot_test_customer(payload, gmail=gmail)
+        customer_uuid, _ = _yahoo_pilot_test_customer(payload, provider=provider)
         sender = _auth_email(payload.get('sender_email'))
         allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
-        if gmail:
+        if provider == 'iCloud':
+            if not sender.endswith('@icloud.com') or sender != _ICLOUD_PILOT_SENDER:
+                raise PermissionError('Choose the approved iCloud test sender.')
+            bundled_packet = _ICLOUD_PILOT_BUNDLED_PACKET
+            fixtures = {_ICLOUD_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE}
+        elif provider == 'Gmail':
             if not sender.endswith('@gmail.com') or sender != _GMAIL_PILOT_SENDER:
                 raise PermissionError('Choose the approved Gmail test sender.')
             bundled_packet = _GMAIL_PILOT_BUNDLED_PACKET
@@ -3116,7 +3147,7 @@ def _prepare_email_pilot(*, gmail=False):
                         (uid,customer_uuid,item['forwarder'],item['profile_key'],sender,item['packet_id'],item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],'NEEDS_PROOF_REVIEW',now,now))
             for order_id, amount in item['orders']:
                 cur.execute(f'INSERT INTO customer_submission_packet_orders (packet_uuid,amazon_order_id,requested_tax) VALUES ({params(3)})',(uid,order_id,amount))
-            _yahoo_pilot_event(cur,uid,'GMAIL_PILOT_PREPARED' if gmail else 'YAHOO_PILOT_PREPARED',{'file_sha256':item['file_sha256']})
+            _yahoo_pilot_event(cur,uid,f'{provider.upper()}_PILOT_PREPARED',{'file_sha256':item['file_sha256']})
             conn.commit()
             return jsonify(ok=True,packet_uuid=uid,status='NEEDS_PROOF_REVIEW',already_registered=False)
         except Exception:
@@ -3134,12 +3165,16 @@ def submission_manager_yahoo_pilot_send():
 
 @app.route('/customer/submission-manager/gmail-pilot-send', methods=['POST'])
 def submission_manager_gmail_pilot_send():
-    return _send_email_pilot(gmail=True)
+    return _send_email_pilot(provider="Gmail")
 
 
-def _send_email_pilot(*, gmail=False):
+@app.route('/customer/submission-manager/icloud-pilot-send', methods=['POST'])
+def submission_manager_icloud_pilot_send():
+    return _send_email_pilot(provider='iCloud')
+
+
+def _send_email_pilot(*, provider="Yahoo"):
     """OFF by default. Reviewed synthetic pilot only, never an Amazon recipient."""
-    provider = 'Gmail' if gmail else 'Yahoo'
     if not (APP_VERSION.endswith('-STAGING') and
             os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected' and
             safe_bool(os.environ.get(f'SHIPTAXREFUND_STAGING_{provider.upper()}_PILOT_ENABLED', ''))):
@@ -3159,12 +3194,17 @@ def _send_email_pilot(*, gmail=False):
             raise ValueError('Yahoo app password is required for this send only.')
         if payload.get('credential_use_consent') != f'USE_ONCE_FOR_{provider.upper()}_PILOT_SEND':
             raise PermissionError('Explicit one-send credential consent is required.')
-        customer_uuid, owner_email = _yahoo_pilot_test_customer(payload, gmail=gmail)
+        customer_uuid, owner_email = _yahoo_pilot_test_customer(payload, provider=provider)
         sender = _auth_email(payload.get('sender_email'))
         recipient = _auth_email(payload.get('recipient_email'))
         allowed_senders = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
         allowed_recipients = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
-        if gmail:
+        if provider == 'iCloud':
+            if (not sender.endswith('@icloud.com') or not recipient.endswith('@gmail.com') or
+                    sender != _ICLOUD_PILOT_SENDER or recipient != owner_email or
+                    recipient != _ICLOUD_PILOT_RECIPIENT):
+                raise PermissionError('Only the approved iCloud-to-Gmail test pair is permitted.')
+        elif provider == 'Gmail':
             if (not sender.endswith('@gmail.com') or not recipient.endswith('@yahoo.com') or
                     sender != owner_email or sender != _GMAIL_PILOT_SENDER or recipient != _GMAIL_PILOT_RECIPIENT):
                 raise PermissionError('Only the approved Gmail-to-Yahoo test pair is permitted.')
@@ -3208,8 +3248,12 @@ def _send_email_pilot(*, gmail=False):
             # identity or approval is created. Ordinary refund sends retain their
             # existing independent proof-review guard.
             orders, orders_hash = _proof_orders_snapshot(cur, packet)
-            fixture = (_GMAIL_PILOT_FIXTURE if packet['packet_id'] == _GMAIL_PILOT_PACKET_ID else None
-                       ) if gmail else _YAHOO_PILOT_TEST_FIXTURES.get(packet['packet_id'])
+            fixtures = {
+                'Yahoo': _YAHOO_PILOT_TEST_FIXTURES,
+                'Gmail': {_GMAIL_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE},
+                'iCloud': {_ICLOUD_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE},
+            }
+            fixture = fixtures[provider].get(packet['packet_id'])
             if (payload.get('pilot_test_acknowledgement') != 'FICTIONAL_ATTACHMENT_TEST_ONLY' or
                     not fixture or fixture['file_sha256'] != file_hash or
                     fixture['orders_sha256'] != orders_hash or
@@ -3240,7 +3284,10 @@ def _send_email_pilot(*, gmail=False):
             raise
         finally:
             conn.close()
-        if gmail:
+        if provider == 'iCloud':
+            accepted = _yahoo_pilot_accept(sender, password, recipient, message,
+                                          host='smtp.mail.me.com', starttls=True)
+        elif provider == 'Gmail':
             accepted = _yahoo_pilot_accept(sender, password, recipient, message, host='smtp.gmail.com')
         else:
             accepted = _yahoo_pilot_accept(sender, password, recipient, message)
