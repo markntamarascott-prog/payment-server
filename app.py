@@ -1,4 +1,13 @@
+# ShipTaxRefund production release candidate, November 7, 2026.
+# Requires the reviewed production schema and a restricted runtime login.
+# Fictional email pilot routes remain restricted to staging builds.
 import hashlib
+import hmac
+import secrets
+import smtplib
+from urllib.request import Request as _ResendRequest, build_opener as _resend_build_opener, HTTPRedirectHandler as _ResendRedirectHandler
+from urllib.error import HTTPError as _ResendHTTPError, URLError as _ResendURLError
+from email.message import EmailMessage
 import json
 import os
 import re
@@ -21,7 +30,7 @@ except Exception:
     except Exception:
         pass
 
-APP_VERSION = "V10.29.2-max-reset-timeout-fix"
+APP_VERSION = "V10.30.0-PRODUCTION"
 
 app = Flask(__name__)
 
@@ -53,8 +62,7 @@ def handle_unhandled_exception(exc):
         pass
     return jsonify({
         "ok": False,
-        "error": str(exc),
-        "error_type": exc.__class__.__name__,
+        "error": "Internal server error. No transaction result has been confirmed.",
         "version": APP_VERSION,
     }), 500
 
@@ -238,7 +246,7 @@ TABLE_COLUMNS = {
         "expires_at": "TEXT", "notes": "TEXT DEFAULT ''", "last_validated_at": "TEXT", "validation_count": "INTEGER DEFAULT 0",
     },
     "report_statistics": {
-        "report_id": "TEXT PRIMARY KEY", "founder_code": "TEXT DEFAULT ''", "email": "TEXT DEFAULT ''",
+        "report_id": "TEXT PRIMARY KEY", "owner_customer_uuid": "TEXT DEFAULT ''", "founder_code": "TEXT DEFAULT ''", "email": "TEXT DEFAULT ''",
         "app_name": "TEXT DEFAULT ''", "app_version": "TEXT DEFAULT ''", "scan_mode": "TEXT DEFAULT ''", "generated_at": "TEXT",
         "orders_found": "INTEGER DEFAULT 0", "tracking_found": "INTEGER DEFAULT 0", "tax_identified": "TEXT DEFAULT ''",
         "paid_scan": "BOOLEAN DEFAULT FALSE", "payment_session_id": "TEXT DEFAULT ''", "generated_package": "BOOLEAN DEFAULT TRUE",
@@ -307,6 +315,69 @@ TABLE_COLUMNS = {
         "customer_uuid": "TEXT NOT NULL", "forwarder": "TEXT NOT NULL", "profile_key": "TEXT NOT NULL",
         "export_year": "TEXT NOT NULL", "last_sequence_number": "INTEGER DEFAULT 0", "updated_at": "TEXT",
     },
+    # A packet is not submitted until the chosen mail provider accepts the message. The ledger is separate
+    # from legacy customer_submission_history, which prior builds populated at
+    # packet GENERATION time. No Gmail tokens, mailbox bodies or local paths here.
+    "customer_submission_packets": {
+        "packet_uuid": "TEXT PRIMARY KEY", "customer_uuid": "TEXT NOT NULL",
+        "forwarder": "TEXT NOT NULL", "profile_key": "TEXT NOT NULL DEFAULT ''",
+        "amazon_account_email": "TEXT NOT NULL", "packet_id": "TEXT NOT NULL",
+        "packet_type": "TEXT NOT NULL", "invoice_reference": "TEXT DEFAULT ''",
+        "file_name": "TEXT NOT NULL", "file_sha256": "TEXT NOT NULL",
+        "requested_total": "TEXT NOT NULL", "status": "TEXT NOT NULL DEFAULT 'NEEDS_PROOF_REVIEW'",
+        "sender_email": "TEXT DEFAULT ''", "recipient_email": "TEXT DEFAULT ''",
+        "gmail_message_id": "TEXT DEFAULT ''", "gmail_thread_id": "TEXT DEFAULT ''",  # legacy names retained for compatibility
+        "mail_provider": "TEXT DEFAULT ''", "provider_message_id": "TEXT DEFAULT ''",
+        "transport_receipt_type": "TEXT DEFAULT ''",
+        "send_attempt_id": "TEXT DEFAULT ''", "attempted_at": "TEXT DEFAULT ''",
+        "sent_at": "TEXT DEFAULT ''", "archived_at": "TEXT DEFAULT ''",
+        "created_at": "TEXT NOT NULL", "updated_at": "TEXT NOT NULL",
+    },
+    # Audit candidate: protected mode verifies separate ownership and append-only
+    # runtime permissions. Independent attestation remains a release requirement. No client-claimed proof is trusted.
+    # Gate16: a grant is separate from customer ownership. Its bearer source must
+    # be authenticated independently using a second verified mailbox session.
+    # Only digests of founder/payment references are persisted; no raw codes.
+    "customer_entitlement_links": {
+        "link_uuid": "TEXT PRIMARY KEY", "customer_uuid": "TEXT NOT NULL",
+        "entitlement_type": "TEXT NOT NULL", "reference_digest": "TEXT NOT NULL",
+        "source_verified_email": "TEXT NOT NULL", "linked_at": "TEXT NOT NULL",
+        "revoked_at": "TEXT NOT NULL DEFAULT ''", "consent_version": "TEXT NOT NULL",
+    },
+    "customer_submission_proof_reviews": {
+        "review_uuid": "TEXT PRIMARY KEY", "packet_uuid": "TEXT NOT NULL",
+        "customer_uuid": "TEXT NOT NULL", "reviewer_customer_uuid": "TEXT NOT NULL",
+        "reviewer_email": "TEXT NOT NULL", "review_decision": "TEXT NOT NULL",
+        "review_reason_code": "TEXT NOT NULL", "file_sha256": "TEXT NOT NULL",
+        "orders_sha256": "TEXT NOT NULL", "attestation_code": "TEXT NOT NULL",
+        "decided_at": "TEXT NOT NULL",
+    },
+    "customer_submission_packet_orders": {
+        "packet_uuid": "TEXT NOT NULL", "amazon_order_id": "TEXT NOT NULL",
+        "requested_tax": "TEXT NOT NULL DEFAULT '0.00'",
+    },
+    "customer_submission_events": {
+        "event_id": "TEXT PRIMARY KEY", "packet_uuid": "TEXT NOT NULL",
+        "event_type": "TEXT NOT NULL", "event_at": "TEXT NOT NULL",
+        "details_json": "TEXT DEFAULT '{}'",
+    },
+    # Additive, isolated customer-email authorization tables. The existing
+    # founder/payment and submission tables are deliberately not changed.
+    "customer_auth_challenges": {
+        "challenge_uuid": "TEXT PRIMARY KEY", "email": "TEXT NOT NULL",
+        "code_hash": "TEXT NOT NULL", "created_at": "TEXT NOT NULL",
+        "expires_at": "TEXT NOT NULL", "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "consumed_at": "TEXT DEFAULT ''", "send_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+    },
+    "customer_auth_sessions": {
+        "token_hash": "TEXT PRIMARY KEY", "customer_uuid": "TEXT NOT NULL",
+        "created_at": "TEXT NOT NULL", "expires_at": "TEXT NOT NULL",
+        "revoked_at": "TEXT DEFAULT ''",
+    },
+    "customer_auth_rate_events": {
+        "event_uuid": "TEXT PRIMARY KEY", "rate_key": "TEXT NOT NULL",
+        "created_at": "TEXT NOT NULL",
+    },
     "admin_cloud_reset_archive": {
         "archive_id": "TEXT PRIMARY KEY", "reset_id": "TEXT NOT NULL", "reset_scope": "TEXT DEFAULT ''", "amazon_refund_email": "TEXT DEFAULT ''",
         "customer_uuid": "TEXT DEFAULT ''", "table_name": "TEXT NOT NULL", "row_primary_key": "TEXT DEFAULT ''", "row_payload": "TEXT DEFAULT ''", "created_at": "TEXT",
@@ -326,7 +397,75 @@ def create_table_sql(table, columns):
     return f"CREATE TABLE IF NOT EXISTS {table} (\n    {col_sql}\n)"
 
 
+
+# OFFLINE AUDIT PERMISSION CANDIDATE - NOT APPROVED FOR DEPLOYMENT.
+def _verify_protected_review_database(cur):
+    """Fail closed for privileged logins or mutable review history.
+
+    Administrators remain trusted. This protects against ordinary runtime SQL,
+    not an administrator or host compromise, nor forged new attestations.
+    """
+    cur.execute("SELECT current_user, session_user")
+    active, login = cur.fetchone()
+    if active != login:
+        raise RuntimeError("Audit protection requires a separate runtime login, not SET ROLE from an administrator.")
+    cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE "
+                "pg_has_role(session_user,oid,'MEMBER') AND "
+                "(rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls))")
+    if cur.fetchone()[0]:
+        raise RuntimeError("Privileged database login cannot serve protected review requests.")
+    cur.execute("SELECT c.relowner,n.nspowner,d.datdba FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "JOIN pg_database d ON d.datname=current_database() "
+                "WHERE c.oid='public.customer_submission_proof_reviews'::regclass")
+    owners=cur.fetchone()
+    if not owners:
+        raise RuntimeError("Protected review history is missing.")
+    for owner in owners:
+        cur.execute("SELECT pg_has_role(session_user,%s,'MEMBER')", (owner,))
+        if cur.fetchone()[0]:
+            raise RuntimeError("Runtime login must not own or belong to the audit, schema or database owner.")
+    cur.execute("SELECT has_schema_privilege(current_user,'public','CREATE'), "
+                "has_database_privilege(current_user,current_database(),'CREATE'), "
+                "has_database_privilege(current_user,current_database(),'TEMP')")
+    if any(cur.fetchone()):
+        raise RuntimeError("Runtime login must not create schemas, public objects or temporary objects.")
+    for permission in ('UPDATE','DELETE','TRUNCATE','TRIGGER','REFERENCES','MAINTAIN'):
+        cur.execute("SELECT has_table_privilege(current_user,'public.customer_submission_proof_reviews',%s)", (permission,))
+        if cur.fetchone()[0]:
+            raise RuntimeError("Review history permission refused: " + permission)
+    cur.execute("SELECT has_any_column_privilege(current_user,'public.customer_submission_proof_reviews','UPDATE')")
+    if cur.fetchone()[0]:
+        raise RuntimeError("Column-level review history updates are not allowed.")
+    for permission in ('SELECT','INSERT'):
+        cur.execute("SELECT has_table_privilege(current_user,'public.customer_submission_proof_reviews',%s)", (permission,))
+        if not cur.fetchone()[0]:
+            raise RuntimeError("Review history requires " + permission)
+
+
+def _verify_runtime_schema():
+    if not postgres_available():
+        raise RuntimeError("Protected review history requires PostgreSQL.")
+    conn=get_db_connection()
+    try:
+        cur=conn.cursor()
+        _verify_protected_review_database(cur)
+        for table,columns in TABLE_COLUMNS.items():
+            cur.execute("SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name=%s", (table,))
+            present={row[0] for row in cur.fetchall()}
+            if not set(columns).issubset(present):
+                raise RuntimeError("Schema migration required before runtime: " + table)
+    finally:
+        conn.close()
+
+
 def init_db():
+    mode=os.environ.get("SHIPTAXREFUND_SCHEMA_MODE", "").strip().lower()
+    if mode == "protected":
+        return _verify_runtime_schema()
+    if safe_bool(os.environ.get("SHIPTAXREFUND_PROOF_REVIEW_ENABLED", "")) and mode != "migration":
+        raise RuntimeError("Proof-review candidate requires protected runtime mode; migration credentials must stay offline.")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -349,6 +488,17 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_customer ON customer_export_references (customer_uuid)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_export_references_tracking ON customer_export_references (amazon_tracking_number)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_export_references_tracking ON customer_export_references (customer_uuid, forwarder, profile_key, export_year, amazon_tracking_number)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_submission_packet_customer_id ON customer_submission_packets (customer_uuid, forwarder, profile_key, packet_id)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_submission_packet_order ON customer_submission_packet_orders (packet_uuid, amazon_order_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_order_lookup ON customer_submission_packet_orders (amazon_order_id, packet_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_proof_reviews_latest ON customer_submission_proof_reviews (customer_uuid, packet_uuid, decided_at, review_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_entitlement_links_customer ON customer_entitlement_links (customer_uuid, revoked_at)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_entitlement_links_active_reference ON customer_entitlement_links (entitlement_type, reference_digest) WHERE revoked_at = ''")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_packet_customer_status ON customer_submission_packets (customer_uuid, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_submission_events_packet ON customer_submission_events (packet_uuid, event_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenge_email_created ON customer_auth_challenges (email, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_session_customer ON customer_auth_sessions (customer_uuid)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_auth_rate_key_created ON customer_auth_rate_events (rate_key, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_reset ON admin_cloud_reset_archive (reset_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_cloud_reset_archive_customer ON admin_cloud_reset_archive (customer_uuid)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_founding_members_founder_code_nonblank ON founding_members (founder_code) WHERE founder_code IS NOT NULL AND founder_code <> ''")
@@ -416,7 +566,7 @@ def upsert_payment(session_id, report_id="", amount_cents=0, recovery_total="", 
     init_db()
     status = "paid" if paid else (payment_status or "created")
     now = utc_now_iso()
-    paid_at = now if paid else ""
+    paid_at = now if paid else (None if postgres_available() else "")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -429,7 +579,7 @@ def upsert_payment(session_id, report_id="", amount_cents=0, recovery_total="", 
                     status = CASE WHEN EXCLUDED.status='paid' THEN 'paid' WHEN payments.status='paid' THEN payments.status ELSE EXCLUDED.status END,
                     amount_cents = CASE WHEN EXCLUDED.amount_cents > 0 THEN EXCLUDED.amount_cents ELSE payments.amount_cents END,
                     report_id = COALESCE(NULLIF(EXCLUDED.report_id,''), payments.report_id),
-                    paid_at = COALESCE(NULLIF(EXCLUDED.paid_at,''), payments.paid_at),
+                    paid_at = COALESCE(EXCLUDED.paid_at, payments.paid_at),
                     recovery_total = COALESCE(NULLIF(EXCLUDED.recovery_total,''), payments.recovery_total),
                     app_name = COALESCE(NULLIF(EXCLUDED.app_name,''), payments.app_name),
                     app_version = COALESCE(NULLIF(EXCLUDED.app_version,''), payments.app_version),
@@ -538,7 +688,9 @@ def validate_customer_access_payload(payload):
         if not payment_row_is_paid(row):
             return False, "Payment session was not found or is not paid.", ""
         payment_email = normalize_email((row or {}).get("customer_email", ""))
-        if payment_email and payment_email != email:
+        if not payment_email:
+            return False, "Unbound payment session requires verified account review.", ""
+        if payment_email != email:
             return False, "Payment session email does not match requested customer email.", ""
         return True, "", email
     return False, "A valid access code or paid payment session is required.", ""
@@ -702,6 +854,7 @@ def record_customer_run(payload, customer_uuid):
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (run_id) DO UPDATE SET completed_at=EXCLUDED.completed_at,status=EXCLUDED.status,matched_count=EXCLUDED.matched_count,
                   excluded_prior_count=EXCLUDED.excluded_prior_count,recovery_total=EXCLUDED.recovery_total,raw_payload=EXCLUDED.raw_payload
+                WHERE customer_runs.customer_uuid = EXCLUDED.customer_uuid
                 """, values)
         else:
             cur.execute(
@@ -710,7 +863,11 @@ def record_customer_run(payload, customer_uuid):
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(run_id) DO UPDATE SET completed_at=excluded.completed_at,status=excluded.status,matched_count=excluded.matched_count,
                   excluded_prior_count=excluded.excluded_prior_count,recovery_total=excluded.recovery_total,raw_payload=excluded.raw_payload
+                WHERE customer_runs.customer_uuid = excluded.customer_uuid
                 """, values)
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise PermissionError("Run identifier belongs to another customer.")
         conn.commit()
     finally:
         conn.close()
@@ -1255,9 +1412,14 @@ def upsert_claimant_profile(profile):
                   signature_line=EXCLUDED.signature_line, max_shipping_email=EXCLUDED.max_shipping_email, max_shipping_account_number=EXCLUDED.max_shipping_account_number,
                   amazon_ship_to_address=EXCLUDED.amazon_ship_to_address, export_destination=EXCLUDED.export_destination, preferred_contact_email=EXCLUDED.preferred_contact_email,
                   claimant_label=EXCLUDED.claimant_label, app_name=EXCLUDED.app_name, app_version=EXCLUDED.app_version, source=EXCLUDED.source, raw_payload=EXCLUDED.raw_payload, updated_at=EXCLUDED.updated_at
+                WHERE customer_claimant_profiles.customer_uuid = EXCLUDED.customer_uuid
                 RETURNING *
             """, values)
-            saved = dict(cur.fetchone())
+            matched = cur.fetchone()
+            if matched is None:
+                conn.rollback()
+                raise PermissionError("Claimant profile is owned by a different customer.")
+            saved = dict(matched)
         else:
             cur.execute("""
                 INSERT INTO customer_claimant_profiles (profile_key,customer_uuid,amazon_account_email,claimant_name,signature_line,max_shipping_email,max_shipping_account_number,amazon_ship_to_address,export_destination,preferred_contact_email,claimant_label,app_name,app_version,source,raw_payload,created_at,updated_at)
@@ -1266,7 +1428,11 @@ def upsert_claimant_profile(profile):
                   signature_line=excluded.signature_line, max_shipping_email=excluded.max_shipping_email, max_shipping_account_number=excluded.max_shipping_account_number,
                   amazon_ship_to_address=excluded.amazon_ship_to_address, export_destination=excluded.export_destination, preferred_contact_email=excluded.preferred_contact_email,
                   claimant_label=excluded.claimant_label, app_name=excluded.app_name, app_version=excluded.app_version, source=excluded.source, raw_payload=excluded.raw_payload, updated_at=excluded.updated_at
+                WHERE customer_claimant_profiles.customer_uuid = excluded.customer_uuid
             """, values)
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise PermissionError("Claimant profile is owned by a different customer.")
             cur.execute("SELECT * FROM customer_claimant_profiles WHERE profile_key=?", (profile["profile_key"],))
             saved = row_to_dict(cur, cur.fetchone())
         cur.execute(f"INSERT INTO customer_claimant_profile_events (event_id,profile_key,event_type,raw_payload,created_at) VALUES ({params(5)})", (str(uuid.uuid4()), profile["profile_key"], "profile_upsert", profile["raw_payload"], utc_now_iso()))
@@ -1289,32 +1455,68 @@ def get_claimant_profiles(customer_uuid, amazon_account_email="", max_shipping_a
     return execute_all("SELECT * FROM customer_claimant_profiles WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC", args)
 
 
-def upsert_report_statistics(payload):
+def upsert_report_statistics(payload, owner_customer_uuid, authorized_email, authorized_founder_code="", authorized_payment_session_id=""):
+    """Safeguard new stats and owned re-writes with an atomic owner predicate.
+
+    Existing legacy rows with no owner_customer_uuid are NEVER automatically claimed.
+    This is a STAGING DESIGN PREVIEW; PostgreSQL behavior is not live-tested.
+    """
+    owner_customer_uuid = clean_text(owner_customer_uuid, 120)
+    authorized_email = normalize_email(authorized_email)
+    if not owner_customer_uuid or not authorized_email:
+        raise PermissionError("Verified customer owner required.")
     init_db()
-    report_id = clean_text(payload.get("report_id", ""))
+    report_id = clean_text(payload.get("report_id", ""), 120)
     if not report_id:
         raise ValueError("report_id is required.")
-    values = (report_id, normalize_code(payload.get("founder_code", "")), normalize_email(payload.get("email", "")), clean_text(payload.get("app_name", "")), clean_text(payload.get("app_version", "")), clean_text(payload.get("scan_mode", "")), clean_text(payload.get("generated_at") or utc_now_iso()), int(payload.get("orders_found", 0) or 0), int(payload.get("tracking_found", 0) or 0), clean_text(payload.get("tax_identified") or payload.get("recovery_total", "")), safe_bool(payload.get("paid_scan", False)), clean_text(payload.get("payment_session_id", "")), safe_bool(payload.get("generated_package", True)), safe_bool(payload.get("proof_consent", True)), clean_text(payload.get("notes", "")), json_text(payload))
+    # The caller does not get to choose owner identity or entitlement credentials.
+    sanitized = {k:v for k,v in payload.items() if k not in (
+        "founder_code", "code", "payment_session_id", "session_id", "token",
+        "authorization", "admin_token", "owner_customer_uuid", "customer_uuid")}
+    values = (report_id, owner_customer_uuid, normalize_code(authorized_founder_code),
+              authorized_email, clean_text(payload.get("app_name", "")),
+              clean_text(payload.get("app_version", "")), clean_text(payload.get("scan_mode", "")),
+              clean_text(payload.get("generated_at") or utc_now_iso()),
+              int(payload.get("orders_found", 0) or 0), int(payload.get("tracking_found", 0) or 0),
+              clean_text(payload.get("tax_identified") or payload.get("recovery_total", "")),
+              bool(authorized_payment_session_id), clean_text(authorized_payment_session_id),
+              safe_bool(payload.get("generated_package", True)),
+              safe_bool(payload.get("proof_consent", True)), clean_text(payload.get("notes", "")),
+              json_text(sanitized))
+    cols = ("report_id,owner_customer_uuid,founder_code,email,app_name,app_version,scan_mode,"
+            "generated_at,orders_found,tracking_found,tax_identified,paid_scan,payment_session_id,"
+            "generated_package,proof_consent,notes,raw_payload")
+    changes = ("app_name=excluded.app_name,app_version=excluded.app_version,"
+               "scan_mode=excluded.scan_mode,generated_at=excluded.generated_at,"
+               "orders_found=excluded.orders_found,tracking_found=excluded.tracking_found,"
+               "tax_identified=excluded.tax_identified,paid_scan=excluded.paid_scan,"
+               "payment_session_id=excluded.payment_session_id,"
+               "generated_package=excluded.generated_package,proof_consent=excluded.proof_consent,"
+               "notes=excluded.notes,raw_payload=excluded.raw_payload")
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        if postgres_available():
-            cur.execute("""
-                INSERT INTO report_statistics (report_id,founder_code,email,app_name,app_version,scan_mode,generated_at,orders_found,tracking_found,tax_identified,paid_scan,payment_session_id,generated_package,proof_consent,notes,raw_payload)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (report_id) DO UPDATE SET founder_code=COALESCE(NULLIF(EXCLUDED.founder_code,''), report_statistics.founder_code), email=COALESCE(NULLIF(EXCLUDED.email,''), report_statistics.email), app_name=COALESCE(NULLIF(EXCLUDED.app_name,''), report_statistics.app_name), app_version=COALESCE(NULLIF(EXCLUDED.app_version,''), report_statistics.app_version), scan_mode=COALESCE(NULLIF(EXCLUDED.scan_mode,''), report_statistics.scan_mode), generated_at=EXCLUDED.generated_at, orders_found=EXCLUDED.orders_found, tracking_found=EXCLUDED.tracking_found, tax_identified=COALESCE(NULLIF(EXCLUDED.tax_identified,''), report_statistics.tax_identified), paid_scan=EXCLUDED.paid_scan, payment_session_id=COALESCE(NULLIF(EXCLUDED.payment_session_id,''), report_statistics.payment_session_id), generated_package=EXCLUDED.generated_package, proof_consent=EXCLUDED.proof_consent, notes=COALESCE(NULLIF(EXCLUDED.notes,''), report_statistics.notes), raw_payload=EXCLUDED.raw_payload
-            """, values)
-            cur.execute("INSERT INTO refund_outcomes (report_id,founder_code,email,status,created_at,updated_at) VALUES (%s,%s,%s,'Not Submitted',%s,%s) ON CONFLICT (report_id) DO NOTHING", (report_id, values[1], values[2], utc_now_iso(), utc_now_iso()))
-        else:
-            cur.execute("""
-                INSERT INTO report_statistics (report_id,founder_code,email,app_name,app_version,scan_mode,generated_at,orders_found,tracking_found,tax_identified,paid_scan,payment_session_id,generated_package,proof_consent,notes,raw_payload)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(report_id) DO UPDATE SET founder_code=CASE WHEN excluded.founder_code!='' THEN excluded.founder_code ELSE founder_code END, email=CASE WHEN excluded.email!='' THEN excluded.email ELSE email END, app_name=CASE WHEN excluded.app_name!='' THEN excluded.app_name ELSE app_name END, app_version=CASE WHEN excluded.app_version!='' THEN excluded.app_version ELSE app_version END, scan_mode=CASE WHEN excluded.scan_mode!='' THEN excluded.scan_mode ELSE scan_mode END, generated_at=excluded.generated_at, orders_found=excluded.orders_found, tracking_found=excluded.tracking_found, tax_identified=CASE WHEN excluded.tax_identified!='' THEN excluded.tax_identified ELSE tax_identified END, paid_scan=excluded.paid_scan, payment_session_id=CASE WHEN excluded.payment_session_id!='' THEN excluded.payment_session_id ELSE payment_session_id END, generated_package=excluded.generated_package, proof_consent=excluded.proof_consent, notes=CASE WHEN excluded.notes!='' THEN excluded.notes ELSE notes END, raw_payload=excluded.raw_payload
-            """, values)
-            cur.execute("INSERT OR IGNORE INTO refund_outcomes (report_id,founder_code,email,status,created_at,updated_at) VALUES (?,?,?,'Not Submitted',?,?)", (report_id, values[1], values[2], utc_now_iso(), utc_now_iso()))
+        marks=params(17)
+        # WHERE on the conflict UPDATE is atomic. Null/blank old owners do not qualify.
+        sql=(f"INSERT INTO report_statistics ({cols}) VALUES ({marks}) "
+             f"ON CONFLICT(report_id) DO UPDATE SET {changes} "
+             "WHERE report_statistics.owner_customer_uuid=excluded.owner_customer_uuid")
+        cur.execute(sql, values)
+        if cur.rowcount != 1:
+            conn.rollback()
+            raise PermissionError("Report identifier is not editable by this account.")
+        # Statistics and refund outcome remain separate; never overwrite any prior outcome.
+        cur.execute(f"INSERT INTO refund_outcomes (report_id,founder_code,email,status,created_at,updated_at) "
+                    f"VALUES ({params(6)}) ON CONFLICT(report_id) DO NOTHING",
+                    (report_id, normalize_code(authorized_founder_code), authorized_email,
+                     "Not Submitted", utc_now_iso(), utc_now_iso()))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
 
 
 def refund_tracker_email_from_payload(payload):
@@ -1323,11 +1525,34 @@ def refund_tracker_email_from_payload(payload):
     return email if email and "@" in email else ""
 
 
+# STAGING ONLY, NOT A COMPLETE ACCOUNT-LINKING IMPLEMENTATION.
+# These routes must never resolve an account by a claimant-supplied email.
+# Existing legacy rows stay with their original UUID, not automatically linked.
+class _RefundTrackerSigninRequired(PermissionError):
+    pass
+
+
+class _RefundTrackerSigninUnavailable(RuntimeError):
+    pass
+
+
 def resolve_free_refund_tracker_customer(payload):
-    email = refund_tracker_email_from_payload(payload)
-    if not email:
-        raise PermissionError("Amazon refund email / Amazon account email is required.")
-    return get_or_create_customer(email, payload.get("display_name") or payload.get("customer_name") or payload.get("claimant_name") or "", "free_refund_tracker"), email
+    if not _auth_ready():
+        raise _RefundTrackerSigninUnavailable('Verified sign-in is not available.')
+    principal = _auth_current_customer()
+    if not principal:
+        raise _RefundTrackerSigninRequired('Verified customer sign-in is required.')
+    # The Amazon shopping email is NOT the verified sign-in identity.
+    # Never accept the generic `email` field as an Amazon account proof.
+    email = normalize_email(payload.get('amazon_refund_email', '') or
+                            payload.get('amazon_account_email', '') or
+                            payload.get('amazon_email', ''))
+    if not email or len(email) > 254 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        raise PermissionError('Amazon shopping email is required as an unverified profile label.')
+    requested_uuid = clean_text(payload.get('customer_uuid', ''))
+    if requested_uuid and requested_uuid != principal['customer_uuid']:
+        raise PermissionError('Requested customer account does not belong to this sign-in.')
+    return {'customer_uuid':principal['customer_uuid'],'email':principal['email']}, email
 
 
 def enrich_refund_tracker_records_with_email(records, amazon_refund_email):
@@ -1335,8 +1560,10 @@ def enrich_refund_tracker_records_with_email(records, amazon_refund_email):
     for record in records if isinstance(records, list) else []:
         if isinstance(record, dict):
             row = dict(record)
-            if not normalize_email(row.get("amazon_account_email") or row.get("Amazon Account Email")):
-                row["amazon_account_email"] = amazon_refund_email
+            row["amazon_account_email"] = amazon_refund_email
+            row.pop("Amazon Account Email", None)
+            row.pop("refund_id", None)
+            row.pop("lifecycle_id", None)
             out.append(row)
     return out
 
@@ -1361,6 +1588,8 @@ def index():
         "cloud_refund_lifecycle_enabled": True,
         "cloud_refunds_received_enabled": True,
         "cloud_export_references_enabled": True,
+        "email_auth_enabled": _auth_enabled(),
+        "release_build": "2026-11-07-production-candidate-01",
         "admin_max_only_reset_enabled": True,
         "export_reference_resolver_version": "V10.29.1",
         "max_invoice_controlled_reset_version": "V10.29.1",
@@ -1400,8 +1629,9 @@ def admin_create_founder_code():
     try:
         create_or_update_founder_code(founder_code, email, expires_at, clean_text(payload.get("notes", "")), safe_bool(payload.get("active", True)), clean_text(payload.get("membership_type", "Founding Member")) or "Founding Member")
         return jsonify({"created": True, "founder_code": founder_code, "email": email, "expires_at": expires_at, "active": safe_bool(payload.get("active", True)), "membership_type": clean_text(payload.get("membership_type", "Founding Member")) or "Founding Member", "version": APP_VERSION})
-    except Exception as exc:
-        return jsonify({"created": False, "error": str(exc), "version": APP_VERSION}), 500
+    except Exception:
+        app.logger.exception("Founder creation failed - details withheld")
+        return jsonify({"created": False, "error": "Founder creation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/validate-founder-code", methods=["POST"])
@@ -1425,35 +1655,311 @@ def validate_founder_code():
 
 @app.route("/record-report-statistics", methods=["POST"])
 def record_report_statistics():
+    """Session-bound report storage: verified principal PLUS valid founder/paid entitlement.
+
+    Unsupported legacy reports and divergent mailbox identities require a reviewed
+    account-link migration, not an implicit email-to-account transfer.
+    """
+    if not _auth_ready():
+        return jsonify({"recorded":False,"error":"Verified sign-in is unavailable.","version":APP_VERSION}), 503
+    principal = _auth_current_customer()
+    if not principal:
+        return jsonify({"recorded":False,"error":"Verified sign-in required.","version":APP_VERSION}), 401
     payload, error = require_json_payload()
     if error:
-        return jsonify({"recorded": False, "error": error, "version": APP_VERSION}), 400
-    founder_code = normalize_code(payload.get("founder_code", ""))
-    email = normalize_email(payload.get("email", ""))
-    if founder_code or email:
-        valid, reason = founder_row_is_active(get_founder_member(founder_code, email))
-        if not valid:
-            return jsonify({"recorded": False, "error": reason, "version": APP_VERSION}), 403
+        return jsonify({"recorded":False,"error":error,"version":APP_VERSION}), 400
+    requested_uuid=clean_text(payload.get("customer_uuid") or payload.get("owner_customer_uuid"),120)
+    account_uuid=clean_text(principal.get("customer_uuid",""),120)
+    account_email=normalize_email(principal.get("email",""))
+    if not account_uuid or not account_email or (requested_uuid and requested_uuid != account_uuid):
+        return jsonify({"recorded":False,"error":"Account ownership verification failed.","version":APP_VERSION}), 403
+    claimed_email=normalize_email(payload.get("email", ""))
+    if claimed_email and claimed_email != account_email:
+        return jsonify({"recorded":False,"error":"Report contact and verified sign-in do not match; ownership review is required.","version":APP_VERSION}), 403
+    founder=normalize_code(payload.get("founder_code","") or payload.get("code",""))
+    payment_id=clean_text(payload.get("payment_session_id","") or payload.get("session_id",""),200)
+    if (bool(founder) + bool(payment_id)) != 1:
+        return jsonify({"recorded":False,"error":"One verified founder or paid entitlement is required.","version":APP_VERSION}), 403
+    if founder:
+        valid, reason=founder_row_is_active(get_founder_member(founder, account_email))
+        if not valid and not _link_access_granted("founder", founder, account_uuid, account_email):
+            return jsonify({"recorded":False,"error":"Entitlement not authorized for this account.","version":APP_VERSION}), 403
+    else:
+        payment=get_payment(payment_id)
+        if not (payment_row_is_paid(payment) and normalize_email((payment or {}).get('customer_email',''))==account_email) and not _link_access_granted("payment", payment_id, account_uuid, account_email):
+            return jsonify({"recorded":False,"error":"Verified paid session does not belong to this account.","version":APP_VERSION}), 403
+    if not clean_text(payload.get("report_id",""),120):
+        return jsonify({"recorded":False,"error":"report_id is required.","version":APP_VERSION}), 400
     try:
-        upsert_report_statistics(payload)
-        return jsonify({"recorded": True, "report_id": clean_text(payload.get("report_id", "")), "version": APP_VERSION})
-    except Exception as exc:
-        return jsonify({"recorded": False, "error": str(exc), "version": APP_VERSION}), 500
+        upsert_report_statistics(payload, account_uuid, account_email, founder, payment_id)
+        return jsonify({"recorded":True,"report_id":clean_text(payload.get("report_id",""),120),"version":APP_VERSION})
+    except PermissionError:
+        return jsonify({"recorded":False,"error":"Report identifier is not editable by this account.","version":APP_VERSION}), 409
+    except (ValueError,TypeError):
+        return jsonify({"recorded":False,"error":"Invalid report statistics.","version":APP_VERSION}), 400
+    except Exception:
+        app.logger.exception("Report storage failed")
+        return jsonify({"recorded":False,"error":"Report statistics storage could not be confirmed.","version":APP_VERSION}), 503
+
+
+
+def _verified_entitled_customer(payload):
+    """Verified account AND preexisting entitlement, never a claimed email.
+
+    Safety-first design preview: a founder/paid membership with a DIFFERENT
+    registered email is NOT linked automatically. A reviewed link is required.
+    Returns (owner, diagnostic, HTTP status). Makes NO entitlement changes.
+    """
+    if not _auth_ready():
+        return None, "Verified cloud sign-in is unavailable.", 503
+    principal=_auth_current_customer()
+    if not principal:
+        return None, "Verified customer sign-in is required.", 401
+    owner_id=clean_text(principal.get("customer_uuid", ""),120)
+    owner_email=normalize_email(principal.get("email", ""))
+    if not owner_id or not owner_email:
+        return None, "Verified account is incomplete.", 403
+    claimed_id=clean_text(payload.get("customer_uuid", "") or payload.get("owner_customer_uuid", ""),120)
+    claimed_email=normalize_email(payload.get("email", ""))
+    if claimed_id and claimed_id!=owner_id:
+        return None, "Requested customer does not belong to this sign-in.", 403
+    if claimed_email and claimed_email!=owner_email:
+        return None, "Account email does not match verified cloud sign-in; review is required.", 403
+    founder=normalize_code(payload.get("founder_code", "") or payload.get("code", ""))
+    payment_id=clean_text(payload.get("payment_session_id", "") or payload.get("session_id", ""),200)
+    if (bool(founder)+bool(payment_id))!=1:
+        return None, "Exactly one verified founder or paid entitlement is required.", 403
+    if founder:
+        row=get_founder_member(founder,owner_email)
+        valid,_reason=founder_row_is_active(row)
+        if not valid and not _link_access_granted("founder", founder, owner_id, owner_email):
+            return None, "Founder membership is not valid for this signed-in account.", 403
+    else:
+        paid=get_payment(payment_id)
+        if not (payment_row_is_paid(paid) and normalize_email((paid or {}).get("customer_email", ""))==owner_email) and not _link_access_granted("payment", payment_id, owner_id, owner_email):
+            return None, "Payment is not verified for this signed-in account.", 403
+    return {"customer_uuid":owner_id,"email":owner_email,
+            "display_name":principal.get("display_name", "")}, "", 200
+
+
+# --- Gate16: explicit dual-mailbox entitlement linkage, STAGING ONLY, DEFAULT OFF ---
+# A customer cloud identity, an Amazon shopping address, and a founder/payment
+# source mailbox have DISTINCT meanings. This never moves historical UUID data.
+_LINK_CONSENT_V1 = "I authorize this entitlement for my signed-in ShipTaxRefund account"
+_LINK_SOURCE_CONSENT_V1 = "I authorize this entitlement to be linked from my verified source mailbox"
+_LINK_REFERENCE_RE = re.compile(r"[A-Za-z0-9_\-]{8,200}\Z")
+
+
+def _link_enabled():
+    return bool(APP_VERSION.endswith("-PRODUCTION") and _auth_ready() and
+                safe_bool(os.environ.get("SHIPTAXREFUND_CROSS_EMAIL_LINK_ENABLED", "")))
+
+
+def _link_reference(kind, raw):
+    kind = str(kind or "").strip().lower()
+    if kind == "founder":
+        ref = normalize_code(raw)
+    elif kind == "payment":
+        ref = str(raw or "").strip()
+    else:
+        return ""
+    if len(ref) < 8 or len(ref) > 200 or not _LINK_REFERENCE_RE.fullmatch(ref):
+        return ""
+    return ref
+
+
+def _link_digest(kind, reference):
+    # HMAC with server secret, not plain SHA256 of potentially guessable code.
+    return _auth_hmac("account-entitlement:" + kind, reference)
+
+
+def _link_secondary_principal():
+    """Authenticate SECOND bearer independently against unrevoked session row."""
+    value = str(request.headers.get("X-ShipTaxRefund-Source-Authorization", ""))
+    if not value.startswith("Bearer "):
+        return None
+    token = value[7:].strip()
+    if not 40 <= len(token) <= 200 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        return None
+    row = execute_one(
+        f"SELECT s.customer_uuid,c.email,s.created_at,s.expires_at,s.revoked_at "
+        f"FROM customer_auth_sessions s JOIN customers c "
+        f"ON c.customer_uuid=s.customer_uuid WHERE s.token_hash={param()}",
+        (_auth_hmac("session", token),),
+    )
+    if not row or row["revoked_at"]:
+        return None
+    try:
+        created = datetime.fromisoformat(str(row["created_at"]))
+        expires = datetime.fromisoformat(str(row["expires_at"]))
+        if created.tzinfo is None or expires.tzinfo is None:
+            return None
+        age = utc_now() - created
+        # A secondary source mailbox must have verified RECENTLY; a stale
+        # 30-day sign-in alone cannot approve a new cross-email grant.
+        if expires < utc_now() or not timedelta(seconds=-30) <= age <= timedelta(minutes=10):
+            return None
+    except (ValueError, TypeError):
+        return None
+    return row
+
+
+def _link_entitlement_valid_for_source(kind, reference, source_email):
+    if kind == "founder":
+        row = get_founder_member(reference, source_email)
+        return founder_row_is_active(row)[0]
+    if kind == "payment":
+        row = get_payment(reference)
+        return bool(payment_row_is_paid(row) and
+                    normalize_email((row or {}).get("customer_email", "")) == source_email)
+    return False
+
+
+def _link_access_granted(kind, reference, customer_uuid, customer_email):
+    """Fail closed and revalidate CURRENT entitlement; do not move source UUID data."""
+    if not _link_enabled() or not customer_uuid or not customer_email:
+        return False
+    reference = _link_reference(kind, reference)
+    if not reference:
+        return False
+    row = execute_one(
+        f"SELECT source_verified_email FROM customer_entitlement_links WHERE "
+        f"customer_uuid={param()} AND entitlement_type={param()} AND "
+        f"reference_digest={param()} AND revoked_at=''",
+        (customer_uuid, kind, _link_digest(kind, reference)),
+    )
+    source = normalize_email((row or {}).get("source_verified_email", ""))
+    if not source or source == customer_email:
+        return False
+    return _link_entitlement_valid_for_source(kind, reference, source)
+
+
+@app.route("/customer/entitlements/link", methods=["POST"])
+def customer_entitlement_link():
+    if not _link_enabled():
+        return jsonify({"ok": False, "error": "Linking is disabled.", "version": APP_VERSION}), 503
+    owner = _auth_current_customer()
+    source = _link_secondary_principal()
+    if not owner or not source:
+        return jsonify({"ok": False, "error": "Two independent verified sessions are required.", "version": APP_VERSION}), 401
+    data, err = require_json_payload()
+    if err or not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request.", "version": APP_VERSION}), 400
+    kind = str(data.get("entitlement_type", "")).strip().lower()
+    reference = _link_reference(kind, data.get("entitlement_reference", ""))
+    owner_uuid = clean_text(owner.get("customer_uuid", ""),120)
+    source_uuid = clean_text(source.get("customer_uuid", ""),120)
+    owner_email = _auth_email(owner.get("email", ""))
+    source_email = _auth_email(source.get("email", ""))
+    if (not reference or not owner_uuid or not source_uuid or
+            not owner_email or not source_email or
+            owner_uuid == source_uuid or owner_email == source_email or
+            data.get("consent") != _LINK_CONSENT_V1 or
+            data.get("source_consent") != _LINK_SOURCE_CONSENT_V1):
+        return jsonify({"ok": False, "error": "Verified ownership and explicit consent required.", "version": APP_VERSION}), 403
+    # Do not accept a claimed email in place of either verified bearer.
+    if data.get("customer_uuid") or data.get("source_email") or data.get("owner_email"):
+        return jsonify({"ok": False, "error": "Account identity must come from verified sessions.", "version": APP_VERSION}), 403
+    # No prior link can be reused or reassigned by the client.
+    try:
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            digest = _link_digest(kind, reference)
+            if postgres_available():
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (digest,))
+            else:
+                cur.execute("BEGIN IMMEDIATE")
+            # Lock entitlement source within this transaction, protecting
+            # against concurrent founder reassignment or payment status writes.
+            if kind == "founder":
+                cur.execute(f"SELECT * FROM founding_members WHERE founder_code={param()}" +
+                            (" FOR UPDATE" if postgres_available() else ""), (reference,))
+                row = row_to_dict(cur, cur.fetchone())
+                good = bool(row and normalize_email(row.get("email")) == source_email and founder_row_is_active(row)[0])
+            else:
+                cur.execute(f"SELECT * FROM payments WHERE session_id={param()}" +
+                            (" FOR UPDATE" if postgres_available() else ""), (reference,))
+                row = row_to_dict(cur, cur.fetchone())
+                good = bool(row and normalize_email(row.get("customer_email")) == source_email and payment_row_is_paid(row))
+            if not good:
+                conn.rollback()
+                return jsonify({"ok": False, "error": "Source entitlement could not be verified.", "version": APP_VERSION}), 403
+            cur.execute(f"SELECT customer_uuid,source_verified_email FROM customer_entitlement_links "
+                        f"WHERE entitlement_type={param()} AND reference_digest={param()} AND revoked_at=''" +
+                        (" FOR UPDATE" if postgres_available() else ""), (kind, digest))
+            prior = row_to_dict(cur, cur.fetchone())
+            if prior:
+                if (prior["customer_uuid"] == owner_uuid and
+                        normalize_email(prior["source_verified_email"]) == source_email):
+                    conn.commit()
+                    return jsonify({"ok": True, "linked": True, "already_linked": True, "version": APP_VERSION})
+                conn.rollback()
+                return jsonify({"ok": False, "error": "This entitlement is already linked to another account.", "version": APP_VERSION}), 409
+            cur.execute(f"INSERT INTO customer_entitlement_links "
+                        f"(link_uuid,customer_uuid,entitlement_type,reference_digest,source_verified_email,linked_at,revoked_at,consent_version) "
+                        f"VALUES ({params(8)})",
+                        (str(uuid.uuid4()),owner_uuid,kind,digest,source_email,utc_now_iso(),"","DUAL_MAILBOX_V1"))
+            conn.commit()
+            return jsonify({"ok": True, "linked": True, "already_linked": False, "version": APP_VERSION})
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.exception("Entitlement link transaction failed (no secret logged)")
+        return jsonify({"ok": False, "error": "Linking could not be confirmed.", "version": APP_VERSION}), 503
+
+
+@app.route("/customer/entitlements/revoke", methods=["POST"])
+def customer_entitlement_revoke():
+    if not _link_enabled():
+        return jsonify({"ok": False, "error": "Linking is disabled.", "version": APP_VERSION}), 503
+    owner = _auth_current_customer()
+    if not owner:
+        return jsonify({"ok": False, "error": "Verified sign-in required.", "version": APP_VERSION}), 401
+    data, err = require_json_payload()
+    if err or not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request.", "version": APP_VERSION}), 400
+    kind = str(data.get("entitlement_type", "")).strip().lower()
+    reference = _link_reference(kind, data.get("entitlement_reference", ""))
+    if not reference:
+        return jsonify({"ok": False, "error": "Valid entitlement reference required.", "version": APP_VERSION}), 400
+    try:
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute(f"UPDATE customer_entitlement_links SET revoked_at={param()} "
+                        f"WHERE customer_uuid={param()} AND entitlement_type={param()} "
+                        f"AND reference_digest={param()} AND revoked_at=''",
+                        (utc_now_iso(), owner["customer_uuid"],kind,_link_digest(kind,reference)))
+            changed = cur.rowcount > 0
+            conn.commit()
+            return jsonify({"ok": True, "revoked": changed, "version": APP_VERSION})
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.exception("Entitlement revocation failed")
+        return jsonify({"ok": False, "error": "Revocation could not be confirmed.", "version": APP_VERSION}), 503
 
 
 @app.route("/customer/resolve", methods=["POST"])
 def customer_resolve():
     payload, error = require_json_payload()
     if error:
-        return jsonify({"resolved": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"resolved": False, "error": reason, "version": APP_VERSION}), 403
-    try:
-        customer = get_or_create_customer(email, payload.get("display_name") or payload.get("customer_name") or "", payload.get("source", "desktop"))
-        return jsonify({"resolved": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "display_name": customer.get("display_name", ""), "version": APP_VERSION})
-    except Exception as exc:
-        return jsonify({"resolved": False, "error": str(exc), "version": APP_VERSION}), 500
+        return jsonify({"resolved":False,"error":error,"version":APP_VERSION}),400
+    owner, reason, status = _verified_entitled_customer(payload)
+    if status!=200:
+        return jsonify({"resolved":False,"error":reason,"version":APP_VERSION}),status
+    # Do not create or reassign a cloud account from an unverified email.
+    return jsonify({"resolved":True,"customer_uuid":owner["customer_uuid"],
+        "email":owner["email"],"display_name":owner.get("display_name", ""),"version":APP_VERSION})
 
 
 @app.route("/customer/history", methods=["POST"])
@@ -1461,16 +1967,21 @@ def customer_history():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         forwarder = clean_text(payload.get("forwarder", "")).lower()
         history, state = get_customer_history(customer.get("customer_uuid", ""), forwarder)
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "forwarder": forwarder, "history": history, "forwarder_state": state, "history_count": len(history), "version": APP_VERSION})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/history/sync", methods=["POST"])
@@ -1478,11 +1989,11 @@ def customer_history_sync():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         forwarder = clean_text(payload.get("forwarder", "")).lower()
         run_id = clean_text(payload.get("run_id", ""))
         synced = upsert_customer_history(customer.get("customer_uuid", ""), payload.get("history", payload.get("records", [])), forwarder, run_id)
@@ -1495,8 +2006,13 @@ def customer_history_sync():
             run_payload.setdefault("run_id", run_id or make_customer_uuid())
             saved_run_id = record_customer_run(run_payload, customer.get("customer_uuid", ""))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "forwarder": forwarder, "synced_count": synced, "run_id": saved_run_id, "version": APP_VERSION})
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/export-references/resolve", methods=["POST"])
@@ -1525,12 +2041,16 @@ def free_export_references_resolve():
             "input_record_count": len(records) if isinstance(records, list) else 0,
             "resolved_references": resolved,
             "resolved_count": len(resolved),
-            "access_model": "free_refund_tracker_amazon_email",
+            "access_model": "staging_verified_customer_uuid_unverified_amazon_profile",
             "resolver_version": "V10.29.0",
             "version": APP_VERSION,
         })
+    except _RefundTrackerSigninRequired:
+        return jsonify({'ok':False, 'error':'Verified customer sign-in is required.', 'version':APP_VERSION}), 401
+    except _RefundTrackerSigninUnavailable:
+        return jsonify({'ok':False, 'error':'Verified sign-in is unavailable.', 'version':APP_VERSION}), 503
     except PermissionError as exc:
-        return jsonify({"ok": False, "error": str(exc), "error_type": exc.__class__.__name__, "version": APP_VERSION}), 400
+        return jsonify({"ok": False, "error": str(exc), "error_type": exc.__class__.__name__, "version": APP_VERSION}), 403
     except Exception as exc:
         try:
             app.logger.exception("Error resolving customer export references")
@@ -1538,8 +2058,7 @@ def free_export_references_resolve():
             pass
         return jsonify({
             "ok": False,
-            "error": str(exc),
-            "error_type": exc.__class__.__name__,
+            "error": "Export-reference resolution could not be confirmed.",
             "resolver_version": "V10.29.0",
             "version": APP_VERSION,
         }), 500
@@ -1553,11 +2072,16 @@ def free_refund_tracker_lifecycle_list():
     try:
         customer, email = resolve_free_refund_tracker_customer(payload)
         rows = get_customer_refund_lifecycle(customer.get("customer_uuid", ""), payload.get("forwarder", ""), payload.get("profile_key", ""), email)
-        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "lifecycle": rows, "lifecycle_count": len(rows), "access_model": "free_refund_tracker_amazon_email", "version": APP_VERSION})
+        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "lifecycle": rows, "lifecycle_count": len(rows), "access_model": "staging_verified_customer_uuid_unverified_amazon_profile", "version": APP_VERSION})
+    except _RefundTrackerSigninRequired:
+        return jsonify({'ok':False, 'error':'Verified customer sign-in is required.', 'version':APP_VERSION}), 401
+    except _RefundTrackerSigninUnavailable:
+        return jsonify({'ok':False, 'error':'Verified sign-in is unavailable.', 'version':APP_VERSION}), 503
     except PermissionError as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception:
+        app.logger.exception("Cloud operation failed - details withheld")
+        return jsonify({"ok": False, "error": "Cloud operation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/customer/refund-tracker/lifecycle/sync", methods=["POST"])
@@ -1570,11 +2094,16 @@ def free_refund_tracker_lifecycle_sync():
         forwarder = clean_text(payload.get("forwarder", "")).lower()
         records = enrich_refund_tracker_records_with_email(payload.get("lifecycle", payload.get("records", [])), email)
         synced = upsert_customer_refund_lifecycle(customer.get("customer_uuid", ""), records, forwarder, clean_text(payload.get("run_id", "")))
-        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "forwarder": forwarder, "synced_count": synced, "access_model": "free_refund_tracker_amazon_email", "version": APP_VERSION})
+        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "forwarder": forwarder, "synced_count": synced, "access_model": "staging_verified_customer_uuid_unverified_amazon_profile", "version": APP_VERSION})
+    except _RefundTrackerSigninRequired:
+        return jsonify({'ok':False, 'error':'Verified customer sign-in is required.', 'version':APP_VERSION}), 401
+    except _RefundTrackerSigninUnavailable:
+        return jsonify({'ok':False, 'error':'Verified sign-in is unavailable.', 'version':APP_VERSION}), 503
     except PermissionError as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception:
+        app.logger.exception("Cloud operation failed - details withheld")
+        return jsonify({"ok": False, "error": "Cloud operation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/customer/refund-tracker/refunds-received", methods=["POST"])
@@ -1585,11 +2114,16 @@ def free_refund_tracker_refunds_received_list():
     try:
         customer, email = resolve_free_refund_tracker_customer(payload)
         rows = get_customer_refunds_received(customer.get("customer_uuid", ""), email)
-        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "refunds_received": rows, "refund_count": len(rows), "access_model": "free_refund_tracker_amazon_email", "version": APP_VERSION})
+        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "refunds_received": rows, "refund_count": len(rows), "access_model": "staging_verified_customer_uuid_unverified_amazon_profile", "version": APP_VERSION})
+    except _RefundTrackerSigninRequired:
+        return jsonify({'ok':False, 'error':'Verified customer sign-in is required.', 'version':APP_VERSION}), 401
+    except _RefundTrackerSigninUnavailable:
+        return jsonify({'ok':False, 'error':'Verified sign-in is unavailable.', 'version':APP_VERSION}), 503
     except PermissionError as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception:
+        app.logger.exception("Cloud operation failed - details withheld")
+        return jsonify({"ok": False, "error": "Cloud operation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/customer/refund-tracker/refunds-received/sync", methods=["POST"])
@@ -1601,11 +2135,16 @@ def free_refund_tracker_refunds_received_sync():
         customer, email = resolve_free_refund_tracker_customer(payload)
         records = enrich_refund_tracker_records_with_email(payload.get("refunds_received", payload.get("records", [])), email)
         synced = upsert_customer_refunds_received(customer.get("customer_uuid", ""), records)
-        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "synced_count": synced, "access_model": "free_refund_tracker_amazon_email", "version": APP_VERSION})
+        return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "amazon_refund_email": email, "synced_count": synced, "access_model": "staging_verified_customer_uuid_unverified_amazon_profile", "version": APP_VERSION})
+    except _RefundTrackerSigninRequired:
+        return jsonify({'ok':False, 'error':'Verified customer sign-in is required.', 'version':APP_VERSION}), 401
+    except _RefundTrackerSigninUnavailable:
+        return jsonify({'ok':False, 'error':'Verified sign-in is unavailable.', 'version':APP_VERSION}), 503
     except PermissionError as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
+    except Exception:
+        app.logger.exception("Cloud operation failed - details withheld")
+        return jsonify({"ok": False, "error": "Cloud operation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/customer/refund-lifecycle", methods=["POST"])
@@ -1613,17 +2152,22 @@ def customer_refund_lifecycle_list():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         rows = get_customer_refund_lifecycle(customer.get("customer_uuid", ""), payload.get("forwarder", ""), payload.get("profile_key", ""), payload.get("amazon_account_email", "") or payload.get("amazon_email", ""))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "lifecycle": rows, "lifecycle_count": len(rows), "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/refund-lifecycle/sync", methods=["POST"])
@@ -1631,17 +2175,22 @@ def customer_refund_lifecycle_sync():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         synced = upsert_customer_refund_lifecycle(customer.get("customer_uuid", ""), payload.get("lifecycle", payload.get("records", [])), clean_text(payload.get("forwarder", "")).lower(), clean_text(payload.get("run_id", "")))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "forwarder": clean_text(payload.get("forwarder", "")).lower(), "synced_count": synced, "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/refunds-received", methods=["POST"])
@@ -1649,17 +2198,22 @@ def customer_refunds_received_list():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         rows = get_customer_refunds_received(customer.get("customer_uuid", ""), payload.get("amazon_account_email", "") or payload.get("amazon_email", ""))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "refunds_received": rows, "refund_count": len(rows), "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/refunds-received/sync", methods=["POST"])
@@ -1667,17 +2221,22 @@ def customer_refunds_received_sync():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         synced = upsert_customer_refunds_received(customer.get("customer_uuid", ""), payload.get("refunds_received", payload.get("records", [])))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "synced_count": synced, "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/claimant-profile", methods=["POST"])
@@ -1685,18 +2244,23 @@ def customer_claimant_profile_upsert():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         saved = upsert_claimant_profile(normalize_claimant_profile_payload(payload, customer.get("customer_uuid", "")))
         profiles = get_claimant_profiles(customer.get("customer_uuid", ""))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "profile": saved, "profile_key": saved.get("profile_key", ""), "profiles": profiles, "profile_count": len(profiles), "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 @app.route("/customer/claimant-profiles", methods=["POST"])
@@ -1704,17 +2268,22 @@ def customer_claimant_profiles_list():
     payload, error = require_json_payload()
     if error:
         return jsonify({"ok": False, "error": error, "version": APP_VERSION}), 400
-    ok, reason, email = validate_customer_access_payload(payload)
-    if not ok:
-        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), 403
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+    email=customer["email"]
     try:
-        customer = resolve_authorized_customer(payload, email)
         profiles = get_claimant_profiles(customer.get("customer_uuid", ""), payload.get("amazon_account_email", "") or payload.get("amazon_email", ""), payload.get("max_shipping_account_number", "") or payload.get("max_account_number", ""))
         return jsonify({"ok": True, "customer_uuid": customer.get("customer_uuid", ""), "email": customer.get("email", email), "profiles": profiles, "profile_count": len(profiles), "version": APP_VERSION})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 403
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except PermissionError:
+        return jsonify({"ok":False,"error":"Customer ownership conflict.","version":APP_VERSION}),403
+    except (ValueError,TypeError):
+        return jsonify({"ok":False,"error":"Invalid customer request.","version":APP_VERSION}),400
+    except Exception:
+        app.logger.exception("Customer cloud storage request failed")
+        return jsonify({"ok":False,"error":"Customer cloud operation could not be confirmed.","version":APP_VERSION}),503
 
 
 MAX_ONLY_RESET_CONFIRM_PHRASE = "RESET MAX ONLY KEEP NAVIVAN"
@@ -1820,8 +2389,9 @@ def admin_max_only_reset():
             raise
         finally:
             cur.close()
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc), "version": APP_VERSION}), 500
+    except Exception:
+        app.logger.exception("Cloud operation failed - details withheld")
+        return jsonify({"ok": False, "error": "Cloud operation could not be confirmed.", "version": APP_VERSION}), 500
     finally:
         conn.close()
 
@@ -1852,8 +2422,9 @@ def create_checkout_session():
         url = checkout_session["url"]
         upsert_payment(session_id, payload.get("report_id", ""), amount_cents, payload.get("recovery_total", ""), payload.get("app_name", "AMAZON-MAXSHIPPING TRACKER"), payload.get("app_version", ""), False, "created", "")
         return jsonify({"id": session_id, "session_id": session_id, "url": url})
-    except Exception as exc:
-        return jsonify({"error": str(exc), "version": APP_VERSION}), 500
+    except Exception:
+        app.logger.exception("Payment or webhook operation failed - details withheld")
+        return jsonify({"error": "Operation could not be confirmed.", "version": APP_VERSION}), 500
 
 
 @app.route("/check-payment/<session_id>", methods=["GET"])
@@ -1877,8 +2448,9 @@ def stripe_webhook():
         return jsonify({"error": "Invalid payload.", "version": APP_VERSION}), 400
     except stripe.error.SignatureVerificationError:
         return jsonify({"error": "Invalid signature.", "version": APP_VERSION}), 400
-    except Exception as exc:
-        return jsonify({"error": str(exc), "version": APP_VERSION}), 400
+    except Exception:
+        app.logger.exception("Unexpected webhook validation failure - details withheld")
+        return jsonify({"error": "Webhook request could not be validated.", "version": APP_VERSION}), 400
     try:
         if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
@@ -1886,8 +2458,1515 @@ def stripe_webhook():
             customer_details = session["customer_details"] if "customer_details" in session else {}
             upsert_payment(session["id"], metadata.get("report_id", ""), int(session["amount_total"] or 0), metadata.get("recovery_total", ""), metadata.get("app_name", ""), metadata.get("app_version", ""), True, session["payment_status"] if "payment_status" in session else "paid", customer_details.get("email", "") if customer_details else "")
         return jsonify({"received": True, "version": APP_VERSION})
+    except Exception:
+        app.logger.exception("Payment or webhook operation failed - details withheld")
+        return jsonify({"error": "Operation could not be confirmed.", "version": APP_VERSION}), 500
+
+
+
+# --- PROVIDER-NEUTRAL SUBMISSION MANAGER LEDGER (STAGING ONLY) ---
+# Customer mail operations are NEVER performed by this backend. The future desktop
+# Gmail OAuth client will do a customer-confirmed send, then record the returned
+# message ID. A send timeout is not evidence that the email was NOT sent.
+
+SUBMISSION_STATUSES = frozenset((
+    "READY_TO_SEND", "NEEDS_PROOF_REVIEW", "SEND_IN_PROGRESS", "SEND_UNCERTAIN", "SENT"
+))
+SUBMISSION_LOCKED = frozenset(("SEND_IN_PROGRESS", "SEND_UNCERTAIN", "SENT"))
+_AMAZON_ORDER_FULL_RE = re.compile(r"\d{3}-\d{7}-\d{7}\Z")
+_SHA256_HEX_RE = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def _submission_row(cur, row):
+    return row_to_dict(cur, row)
+
+
+def _submission_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
+
+
+def _submission_event(cur, packet_uuid, event_type, details=None):
+    details = details if isinstance(details, dict) else {}
+    # Never save Gmail OAuth credentials or email message bodies in this ledger.
+    allowed = {k: details[k] for k in ("message_id", "reason", "archive_status") if k in details}
+    cur.execute(
+        f"INSERT INTO customer_submission_events (event_id,packet_uuid,event_type,event_at,details_json) VALUES ({params(5)})",
+        (str(uuid.uuid4()), packet_uuid, event_type, utc_now_iso(), json.dumps(allowed, sort_keys=True)),
+    )
+
+
+class _SubmissionAuthorizationFailure(Exception):
+    """Explicit 401/403/503 gate result; do not leak credentials."""
+    def __init__(self, reason, status):
+        super().__init__(reason)
+        self.status = status
+
+
+def _submission_authorize(payload):
+    """Authenticate one existing cloud owner AND preexisting entitlement.
+
+    No email-driven customer creation; submitted shopping email stays a separate
+    profile identifier and cannot be used to claim cloud ownership.
+    In this staging service, divergent emails need reviewed
+    account linking, and old clients without a cloud bearer intentionally fail.
+    """
+    customer, reason, status = _verified_entitled_customer(payload)
+    if status != 200:
+        raise _SubmissionAuthorizationFailure(reason, status)
+    return customer["customer_uuid"], customer["email"]
+
+
+def _submission_validate_registration(payload):
+    packet_id = clean_text(payload.get("packet_id", ""), 180)
+    packet_type = clean_text(payload.get("packet_type", ""), 100)
+    invoice = clean_text(payload.get("invoice_reference", ""), 250)
+    file_name = clean_text(payload.get("file_name", ""), 255)
+    file_hash = clean_text(payload.get("file_sha256", "")).lower()
+    profile = clean_text(payload.get("profile_key", ""), 180)
+    forwarder = clean_text(payload.get("forwarder", "")).lower()
+    amazon_email = normalize_email(payload.get("amazon_account_email", ""))
+    if _auth_email(amazon_email) != amazon_email:
+        raise ValueError("Amazon shopping email must be a valid address used as a profile label, not an owner credential.")
+    # Gate13: client-supplied proof_status is NOT an authenticated reviewer
+    # attestation. Never promote packet readiness from a typed JSON field.
+    if not all((packet_id, packet_type, file_name, profile, forwarder, amazon_email)):
+        raise ValueError("packet_id, packet_type, file_name, profile_key, forwarder, amazon_account_email are required.")
+    if not _SHA256_HEX_RE.fullmatch(file_hash):
+        raise ValueError("file_sha256 must be a lowercase or uppercase 64-character SHA256 digest.")
+    if '/' in file_name or '\\' in file_name or file_name.lower().endswith('.pdf') is False:
+        raise ValueError("file_name must be the PDF basename, not a local path.")
+    if packet_type not in ("MAX_INVOICE", "EXISTING_SIGNED_NOTARIZED_MAX_PROOF"):
+        raise ValueError("Unsupported packet_type.")
+    rows = payload.get("orders")
+    if not isinstance(rows, list) or not rows or len(rows) > 5000:
+        raise ValueError("orders must contain 1 to 5000 Amazon order records.")
+    normalized = []
+    seen = set()
+    from decimal import Decimal, InvalidOperation
+    total = Decimal('0.00')
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Each order must be an object.")
+        order_id = clean_text(row.get("amazon_order_id", ""))
+        if not _AMAZON_ORDER_FULL_RE.fullmatch(order_id) or order_id in seen:
+            raise ValueError("Each packet requires unique valid Amazon order numbers.")
+        seen.add(order_id)
+        try:
+            amount = Decimal(str(row.get("requested_tax", "")))
+            if not amount.is_finite() or amount <= 0 or amount != amount.quantize(Decimal('0.01')):
+                raise ValueError()
+        except (ValueError, TypeError, InvalidOperation):
+            raise ValueError(f"Invalid positive tax amount for order {order_id}.")
+        total += amount
+        normalized.append((order_id, str(amount.quantize(Decimal('0.01')))))
+    try:
+        request_total = Decimal(str(payload.get('requested_total', '')))
+    except (InvalidOperation, TypeError):
+        raise ValueError("requested_total is required as a decimal amount.")
+    if request_total != total:
+        raise ValueError("Sum of order taxes does not match packet requested_total.")
+    return {
+        'packet_id':packet_id, 'packet_type':packet_type,'invoice_reference':invoice,
+        'file_name':file_name,'file_sha256':file_hash,'profile_key':profile,
+        'forwarder':forwarder,'amazon_account_email':amazon_email,
+        'requested_total':str(total.quantize(Decimal('0.01'))),
+        'status': 'NEEDS_PROOF_REVIEW',  # Until independent server-side reviewer proof is implemented.
+        'orders':normalized,
+    }
+
+
+def _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=False):
+    sql = f"SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND packet_uuid={param()}"
+    if lock and postgres_available():
+        sql += ' FOR UPDATE'
+    cur.execute(sql, (customer_uuid, packet_uuid))
+    row = cur.fetchone()
+    if row is None:
+        raise LookupError("Packet not found in this customer account.")
+    return _submission_row(cur, row)
+
+
+def _submission_locked_order_conflict(cur, packet):
+    # Blocks overlapping Amazon orders even if the invoice or report ID differs.
+    sql = (
+        'SELECT o.amazon_order_id,p.packet_id,p.status FROM customer_submission_packet_orders o '
+        'JOIN customer_submission_packets p ON p.packet_uuid=o.packet_uuid '
+        f'WHERE p.customer_uuid={param()} AND p.amazon_account_email={param()} '
+        f'AND p.packet_uuid<>{param()} AND p.status IN (\'SEND_IN_PROGRESS\',\'SEND_UNCERTAIN\',\'SENT\') '
+        f'AND o.amazon_order_id IN (SELECT amazon_order_id FROM customer_submission_packet_orders WHERE packet_uuid={param()}) '
+        'LIMIT 1'
+    )
+    cur.execute(sql,(packet['customer_uuid'],packet['amazon_account_email'],packet['packet_uuid'],packet['packet_uuid']))
+    return _submission_row(cur, cur.fetchone()) if cur.description else None
+
+
+def _submission_endpoint_errors(exc):
+    if isinstance(exc, _SubmissionAuthorizationFailure):
+        # A missing/expired bearer is not the same as a forbidden entitlement.
+        return jsonify({'ok': False, 'error': str(exc), 'version': APP_VERSION}), exc.status
+    if isinstance(exc, PermissionError): code=403
+    elif isinstance(exc, LookupError): code=404
+    elif isinstance(exc, ValueError): code=400
+    elif isinstance(exc, RuntimeError): code=409
+    else:
+        app.logger.exception('Submission Manager operation failed (details withheld)')
+        return jsonify({'ok': False, 'error': 'Submission Manager operation could not be confirmed.', 'version': APP_VERSION}), 503
+    return jsonify({'ok': False, 'error': str(exc), 'version': APP_VERSION}), code
+
+
+
+# --- GATE14 PROOF-REVIEW TRUST BOUNDARY (OFFLINE STAGING CANDIDATE ONLY) ---
+# Human review is an authenticated *attestation*, not cryptographic proof that
+# somebody actually inspected a PDF. The application does not store PDF bytes.
+# No status change is authorized from customer-supplied proof_status fields.
+_PROOF_ATTESTATION = "INDEPENDENT_PDF_INVOICE_BOL_ORDER_REVIEW_V1"
+_PROOF_REASONS = frozenset(("all_evidence_matched", "missing_invoice", "bol_mismatch", "order_mismatch", "other"))
+
+
+def _proof_review_authorize():
+    """Both valid cloud session and independent, pre-provisioned reviewer credential."""
+    if os.environ.get("SHIPTAXREFUND_SCHEMA_MODE", "").strip().lower() != "protected":
+        raise _SubmissionAuthorizationFailure("Protected audit database is not configured.", 503)
+    _verify_runtime_schema()
+    if not (APP_VERSION.endswith("-PRODUCTION") and _auth_ready() and
+            safe_bool(os.environ.get("SHIPTAXREFUND_PROOF_REVIEW_ENABLED", ""))):
+        raise _SubmissionAuthorizationFailure("Proof review is not enabled.", 503)
+    allowed = {_auth_email(value) for value in os.environ.get("SHIPTAXREFUND_REVIEWER_EMAILS", "").split(",")}
+    secret = os.environ.get("SHIPTAXREFUND_REVIEWER_TOKEN", "")
+    if len(secret) < 32 or any(ch.isspace() for ch in secret) or not any(allowed):
+        raise _SubmissionAuthorizationFailure("Reviewer service is not configured.", 503)
+    principal = _auth_current_customer()
+    if not principal:
+        raise _SubmissionAuthorizationFailure("Valid reviewer sign-in required.", 401)
+    reviewer_email = _auth_email(principal.get("email"))
+    if not reviewer_email or reviewer_email not in allowed:
+        raise _SubmissionAuthorizationFailure("Reviewer role required.", 403)
+    presented = request.headers.get("X-ShipTaxRefund-Reviewer-Token", "")
+    if not presented or not hmac.compare_digest(secret, presented):
+        raise _SubmissionAuthorizationFailure("Reviewer credential required.", 403)
+    return clean_text(principal.get("customer_uuid"), 120), reviewer_email
+
+
+def _proof_orders_snapshot(cur, packet):
+    """Deterministic server-derived order fingerprint, rejecting malformed historic data."""
+    from decimal import Decimal, InvalidOperation
+    cur.execute(
+        f"SELECT amazon_order_id,requested_tax FROM customer_submission_packet_orders WHERE packet_uuid={param()} ORDER BY amazon_order_id",
+        (packet["packet_uuid"],),
+    )
+    rows = rows_to_dicts(cur, cur.fetchall())
+    if not 1 <= len(rows) <= 5000:
+        raise RuntimeError("Packet order evidence is missing or outside review limits.")
+    seen = set()
+    normalized = []
+    total = Decimal("0.00")
+    for row in rows:
+        order_id = str(row["amazon_order_id"])
+        if order_id in seen or not _AMAZON_ORDER_FULL_RE.fullmatch(order_id):
+            raise RuntimeError("Packet contains duplicate or invalid Amazon order evidence.")
+        seen.add(order_id)
+        try:
+            tax = Decimal(str(row["requested_tax"]))
+            if not tax.is_finite() or tax <= 0 or tax != tax.quantize(Decimal("0.01")):
+                raise ValueError()
+        except (InvalidOperation, ValueError, TypeError):
+            raise RuntimeError("Packet contains invalid tax evidence.") from None
+        total += tax
+        normalized.append({"amazon_order_id": order_id, "requested_tax": format(tax, ".2f")})
+    try:
+        if Decimal(str(packet["requested_total"])) != total:
+            raise RuntimeError("Packet tax total does not match its orders.")
+    except (InvalidOperation, TypeError):
+        raise RuntimeError("Packet total is not valid.") from None
+    serialized = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return normalized, hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _proof_latest_review(cur, packet):
+    cur.execute(
+        f"SELECT * FROM customer_submission_proof_reviews WHERE customer_uuid={param()} AND packet_uuid={param()} "
+        "ORDER BY decided_at DESC,review_uuid DESC LIMIT 1",
+        (packet["customer_uuid"], packet["packet_uuid"]),
+    )
+    return _submission_row(cur, cur.fetchone())
+
+
+def _proof_require_approved(cur, packet):
+    # A historic READY_TO_SEND state is not an authorization by itself.
+    _, current_orders_hash = _proof_orders_snapshot(cur, packet)
+    current_review = _proof_latest_review(cur, packet)
+    allowed = {_auth_email(value) for value in os.environ.get("SHIPTAXREFUND_REVIEWER_EMAILS", "").split(",")}
+    if not (current_review and current_review["review_decision"] == "APPROVED" and
+            current_review["file_sha256"] == packet["file_sha256"] and
+            current_review["orders_sha256"] == current_orders_hash and
+            current_review["customer_uuid"] == packet["customer_uuid"] and
+            current_review["reviewer_customer_uuid"] != packet["customer_uuid"] and
+            _auth_email(current_review["reviewer_email"]) in allowed and
+            current_review["attestation_code"] == _PROOF_ATTESTATION):
+        raise RuntimeError("Packet needs independent, authenticated proof review before sending.")
+    return current_review
+
+
+@app.route('/admin/submission-manager/proof-review/inspect', methods=['POST'])
+def submission_proof_review_inspect():
+    """Reviewer-only metadata. PDF contents must be supplied out-of-band securely."""
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({'ok': False, 'error': error}), 400
+    try:
+        reviewer_uuid, _ = _proof_review_authorize()
+        packet_uuid = clean_text(payload.get('packet_uuid', ''), 120)
+        if not packet_uuid:
+            raise ValueError('packet_uuid is required.')
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute(f"SELECT * FROM customer_submission_packets WHERE packet_uuid={param()}", (packet_uuid,))
+            packet = _submission_row(cur, cur.fetchone())
+            if not packet:
+                raise LookupError('Packet not found.')
+            if reviewer_uuid == packet['customer_uuid']:
+                raise PermissionError('A customer cannot approve their own packet.')
+            orders, digest = _proof_orders_snapshot(cur, packet)
+            return jsonify({'ok': True, 'packet_uuid': packet_uuid,
+                            'packet_id': packet['packet_id'], 'customer_uuid': packet['customer_uuid'],
+                            'file_name': packet['file_name'], 'file_sha256': packet['file_sha256'],
+                            'orders_sha256': digest, 'orders': orders,
+                            'requested_total': packet['requested_total'],
+                            'status': packet['status'],
+                            'reviewer_attestation_required': _PROOF_ATTESTATION,
+                            'pdf_uploaded_to_server': False, 'version': APP_VERSION})
+        finally:
+            conn.close()
     except Exception as exc:
-        return jsonify({"error": str(exc), "version": APP_VERSION}), 500
+        return _submission_endpoint_errors(exc)
+
+
+@app.route('/admin/submission-manager/proof-review/decide', methods=['POST'])
+def submission_proof_review_decide():
+    """Append an attested human decision atomically; never mark email sent."""
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({'ok': False, 'error': error}), 400
+    try:
+        reviewer_uuid, reviewer_email = _proof_review_authorize()
+        packet_uuid = clean_text(payload.get('packet_uuid', ''), 120)
+        verified_file_hash = clean_text(payload.get('reviewed_file_sha256', '')).lower()
+        verified_order_hash = clean_text(payload.get('reviewed_orders_sha256', '')).lower()
+        decision = clean_text(payload.get('decision', ''), 20).upper()
+        reason = clean_text(payload.get('reason_code', ''), 50)
+        attestation = clean_text(payload.get('attestation_code', ''), 100)
+        if not packet_uuid or not _SHA256_HEX_RE.fullmatch(verified_file_hash) or not _SHA256_HEX_RE.fullmatch(verified_order_hash):
+            raise ValueError('Packet ID and both reviewed SHA256 fingerprints are required.')
+        if decision not in ('APPROVED', 'REJECTED') or reason not in _PROOF_REASONS:
+            raise ValueError('Unsupported proof-review decision or reason.')
+        if decision == 'APPROVED' and (attestation != _PROOF_ATTESTATION or reason != 'all_evidence_matched'):
+            raise ValueError('Independent document/order attestation and matching evidence are required for approval.')
+        if decision == 'REJECTED' and reason == 'all_evidence_matched':
+            raise ValueError('Rejection requires a specific non-approval reason.')
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            if postgres_available():
+                # Same owner lock as registration and begin-send. Reviewer cannot
+                # attest to a packet while it is being overwritten/reserved.
+                cur.execute(f'SELECT customer_uuid FROM customer_submission_packets WHERE packet_uuid={param()}', (packet_uuid,))
+                preliminary = _submission_row(cur, cur.fetchone())
+                if not preliminary:
+                    raise LookupError('Packet not found.')
+                cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (preliminary['customer_uuid'],))
+            else:
+                cur.execute('BEGIN IMMEDIATE')
+            cur.execute(f'SELECT * FROM customer_submission_packets WHERE packet_uuid={param()}' +
+                        (' FOR UPDATE' if postgres_available() else ''), (packet_uuid,))
+            packet = _submission_row(cur, cur.fetchone())
+            if not packet:
+                raise LookupError('Packet not found.')
+            if reviewer_uuid == packet['customer_uuid']:
+                raise PermissionError('A customer cannot approve their own packet.')
+            if packet['status'] not in ('NEEDS_PROOF_REVIEW', 'READY_TO_SEND'):
+                raise RuntimeError('Cannot review a packet with an active or historic send attempt.')
+            _, actual_order_hash = _proof_orders_snapshot(cur, packet)
+            if packet['file_sha256'] != verified_file_hash or actual_order_hash != verified_order_hash:
+                raise RuntimeError('PDF fingerprint or order list changed since independent review.')
+            now = utc_now_iso()
+            review_uuid = str(uuid.uuid4())
+            cur.execute(f'INSERT INTO customer_submission_proof_reviews '
+                        f'(review_uuid,packet_uuid,customer_uuid,reviewer_customer_uuid,reviewer_email,review_decision,review_reason_code,file_sha256,orders_sha256,attestation_code,decided_at) '
+                        f'VALUES ({params(11)})',
+                        (review_uuid,packet_uuid,packet['customer_uuid'],reviewer_uuid,reviewer_email,
+                         decision,reason,verified_file_hash,verified_order_hash,
+                         _PROOF_ATTESTATION if decision == 'APPROVED' else '',now))
+            next_state = 'READY_TO_SEND' if decision == 'APPROVED' else 'NEEDS_PROOF_REVIEW'
+            cur.execute(f'UPDATE customer_submission_packets SET status={param()},updated_at={param()} '
+                        f'WHERE packet_uuid={param()} AND customer_uuid={param()}',
+                        (next_state, now, packet_uuid, packet['customer_uuid']))
+            _submission_event(cur, packet_uuid, 'PROOF_REVIEW_' + decision)
+            conn.commit()
+            return jsonify({'ok': True, 'packet_uuid': packet_uuid, 'review_uuid': review_uuid,
+                            'status': next_state, 'review_decision': decision, 'version': APP_VERSION})
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/register', methods=['POST'])
+def submission_manager_register():
+    payload, error = require_json_payload()
+    if error: return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid, customer_email = _submission_authorize(payload)
+        item = _submission_validate_registration(payload)
+        # Amazon shopping mail is a profile label, NOT cloud login identity.
+        # All access to the packet remains bound to verified customer_uuid.
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            if postgres_available():
+                # Use the SAME per-owner transaction lock as begin-send BEFORE
+                # reading or rewriting a packet. PostgreSQL row locks cannot
+                # lock a packet which has not yet been inserted. Without this,
+                # two register requests (or register versus begin-send) can race.
+                # customer_uuid is server-verified, never taken from the JSON body.
+                cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (customer_uuid,))
+            else:
+                cur.execute('BEGIN IMMEDIATE')
+            cur.execute(
+                f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND forwarder={param()} AND profile_key={param()} AND packet_id={param()}' + (' FOR UPDATE' if postgres_available() else ''),
+                (customer_uuid,item['forwarder'],item['profile_key'],item['packet_id']))
+            old = _submission_row(cur, cur.fetchone())
+            # Never silently switch an existing packet to another Amazon profile.
+            if old and normalize_email(old['amazon_account_email']) != item['amazon_account_email']:
+                raise RuntimeError('Existing packet belongs to a different Amazon account profile.')
+            now = utc_now_iso()
+            if old and old['status'] in SUBMISSION_LOCKED:
+                if old['file_sha256'] != item['file_sha256']:
+                    raise RuntimeError('An active or sent packet cannot be replaced with different PDF bytes.')
+                # Immutable after the sending process begins.
+                conn.commit()
+                return jsonify({'ok':True,'packet_uuid':old['packet_uuid'],'status':old['status'],'already_registered':True,'version':APP_VERSION})
+            # An exact repeated registration must not erase a reviewed packet's
+            # readiness. Recheck the server-owned review under the existing lock;
+            # never trust the caller's proof_status or a matching PDF alone.
+            if old and old['status'] == 'READY_TO_SEND':
+                fields = ('packet_type', 'invoice_reference', 'file_name',
+                          'file_sha256', 'requested_total')
+                same_metadata = all(str(old[key]) == str(item[key]) for key in fields)
+                current_orders, _ = _proof_orders_snapshot(cur, old)
+                same_orders = sorted((row['amazon_order_id'], row['requested_tax'])
+                                     for row in current_orders) == sorted(item['orders'])
+                if same_metadata and same_orders:
+                    try:
+                        _proof_require_approved(cur, old)
+                    except RuntimeError:
+                        # Missing/stale/revoked reviewer authority requires review.
+                        pass
+                    else:
+                        conn.commit()
+                        return jsonify({'ok': True, 'packet_uuid': old['packet_uuid'],
+                                        'status': 'READY_TO_SEND', 'already_registered': True,
+                                        'version': APP_VERSION})
+            packet_uuid = old['packet_uuid'] if old else str(uuid.uuid4())
+            if old:
+                cur.execute(
+                    f'UPDATE customer_submission_packets SET packet_type={param()}, invoice_reference={param()}, file_name={param()}, file_sha256={param()}, requested_total={param()}, status={param()}, updated_at={param()} WHERE packet_uuid={param()}',
+                    (item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],item['status'],now,packet_uuid))
+                cur.execute(f'DELETE FROM customer_submission_packet_orders WHERE packet_uuid={param()}',(packet_uuid,))
+            else:
+                cur.execute(
+                    f'INSERT INTO customer_submission_packets (packet_uuid,customer_uuid,forwarder,profile_key,amazon_account_email,packet_id,packet_type,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at) VALUES ({params(14)})',
+                    (packet_uuid,customer_uuid,item['forwarder'],item['profile_key'],item['amazon_account_email'],item['packet_id'],item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],item['status'],now,now))
+            for order_id, amount in item['orders']:
+                cur.execute(f'INSERT INTO customer_submission_packet_orders (packet_uuid,amazon_order_id,requested_tax) VALUES ({params(3)})',(packet_uuid,order_id,amount))
+            _submission_event(cur,packet_uuid,'PACKET_REGISTERED')
+            conn.commit()
+            return jsonify({'ok':True,'packet_uuid':packet_uuid,'status':item['status'],'already_registered':bool(old),'version':APP_VERSION})
+        except Exception:
+            conn.rollback()
+            raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/list', methods=['POST'])
+def submission_manager_list():
+    payload, error = require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_ = _submission_authorize(payload)
+        init_db()
+        packets=execute_all(f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} ORDER BY created_at DESC',(customer_uuid,))
+        conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            for packet in packets:
+                cur.execute(f'SELECT amazon_order_id,requested_tax FROM customer_submission_packet_orders WHERE packet_uuid={param()} ORDER BY amazon_order_id',(packet['packet_uuid'],))
+                packet['orders']=rows_to_dicts(cur,cur.fetchall())
+        finally:conn.close()
+        return jsonify({'ok':True,'packets':packets,'version':APP_VERSION})
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/begin-send', methods=['POST'])
+def submission_manager_begin_send():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        file_hash=clean_text(payload.get('file_sha256','')).lower()
+        sender_email=normalize_email(payload.get('sender_email',''))
+        recipient_email=normalize_email(payload.get('recipient_email',''))
+        mail_provider=clean_text(payload.get('mail_provider','')).lower()
+        if mail_provider not in ('yahoo_smtp', 'gmail_api', 'microsoft_graph'):
+            raise ValueError('Unsupported mail provider for this submission.')
+        if not _SHA256_HEX_RE.fullmatch(file_hash) or not sender_email or '@' not in sender_email or not recipient_email or '@' not in recipient_email:
+            raise ValueError('PDF fingerprint, sender and recipient are required.')
+        init_db(); conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if postgres_available():
+                # Serialize all send reservations for the same customer to avoid
+                # races between different packets that contain one Amazon order.
+                cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(customer_uuid,))
+            else:cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if sender_email != normalize_email(packet['amazon_account_email']):
+                raise PermissionError('Sending mailbox must match the Amazon-linked account email exactly.')
+            if packet['status']!='READY_TO_SEND':
+                raise RuntimeError(f"Packet cannot be sent from status {packet['status']}.")
+            # Gate14: even historic READY_TO_SEND rows must have an authenticated
+            # approved review for the exact CURRENT PDF bytes AND order set.
+            _proof_require_approved(cur, packet)
+            if packet['file_sha256']!=file_hash:
+                raise RuntimeError('Packet PDF has changed since registration. Re-register and review the new PDF.')
+            conflict=_submission_locked_order_conflict(cur,packet)
+            if conflict:
+                raise RuntimeError(f"Amazon order {conflict['amazon_order_id']} is already in active/sent packet {conflict['packet_id']}; review before continuing.")
+            attempt_id=str(uuid.uuid4()); now=utc_now_iso()
+            cur.execute(
+                f"UPDATE customer_submission_packets SET status='SEND_IN_PROGRESS',send_attempt_id={param()},attempted_at={param()},sender_email={param()},recipient_email={param()},mail_provider={param()},updated_at={param()} WHERE packet_uuid={param()}",
+                (attempt_id,now,sender_email,recipient_email,mail_provider,now,packet_uuid))
+            _submission_event(cur,packet_uuid,'SEND_RESERVED')
+            conn.commit()
+            return jsonify({'ok':True,'packet_uuid':packet_uuid,'send_attempt_id':attempt_id,'status':'SEND_IN_PROGRESS','version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+"""Yahoo pilot adapter: no credentials persisted and no automatic resend."""
+# Only the bundled fictional attachment may use the self-test flow.
+_YAHOO_PILOT_TEST_FIXTURES = {'YAHOO-PILOT-20261103-001': {'file_sha256': 'e958a65725e02047b3b39a326539018e5986fdb5ed092abc7e9843457c99bbff', 'orders_sha256': 'c03414e87b95db96cc4cec3599b46fcb368fe03ec9d610ba952e189d857926da', 'requested_total': '0.01'}}
+_YAHOO_PILOT_BUNDLED_PACKET = {'packet_id': 'YAHOO-PILOT-20261103-001', 'packet_type': 'MAX_INVOICE', 'invoice_reference': 'FICTIONAL-TEST-NO-INVOICE', 'file_name': 'ShipTaxRefund_Yahoo_Pilot_Test.pdf', 'file_sha256': 'e958a65725e02047b3b39a326539018e5986fdb5ed092abc7e9843457c99bbff', 'profile_key': 'YAHOO-PILOT-20261103-001', 'forwarder': 'max', 'requested_total': '0.01', 'orders': [{'amazon_order_id': '999-0000000-0000001', 'requested_tax': '0.01'}]}
+_GMAIL_PILOT_PACKET_ID = 'GMAIL-PILOT-20261105-001'
+_GMAIL_PILOT_BUNDLED_PACKET = dict(_YAHOO_PILOT_BUNDLED_PACKET,
+                                  packet_id=_GMAIL_PILOT_PACKET_ID,
+                                  profile_key=_GMAIL_PILOT_PACKET_ID)
+_GMAIL_PILOT_FIXTURE = _YAHOO_PILOT_TEST_FIXTURES[_YAHOO_PILOT_BUNDLED_PACKET['packet_id']]
+_GMAIL_PILOT_SENDER = os.environ.get('SHIPTAXREFUND_STAGING_GMAIL_PILOT_SENDER', '').strip().lower()
+_GMAIL_PILOT_RECIPIENT = os.environ.get('SHIPTAXREFUND_STAGING_GMAIL_PILOT_RECIPIENT', '').strip().lower()
+_ICLOUD_PILOT_PACKET_ID = 'ICLOUD-PILOT-20261105-001'
+_ICLOUD_PILOT_BUNDLED_PACKET = dict(_YAHOO_PILOT_BUNDLED_PACKET,
+                                   packet_id=_ICLOUD_PILOT_PACKET_ID,
+                                   profile_key=_ICLOUD_PILOT_PACKET_ID)
+_ICLOUD_PILOT_SENDER = os.environ.get('SHIPTAXREFUND_STAGING_ICLOUD_PILOT_SENDER', '').strip().lower()
+_ICLOUD_PILOT_RECIPIENT = os.environ.get('SHIPTAXREFUND_STAGING_ICLOUD_PILOT_RECIPIENT', '').strip().lower()
+_YAHOO_PILOT_MAX_PDF = 5 * 1024 * 1024
+_YAHOO_PILOT_MAX_REQUEST = 8 * 1024 * 1024
+_YAHOO_SMTP_FACTORY = smtplib.SMTP_SSL
+
+
+def _yahoo_pilot_event(cur, packet_uuid, event_type, details):
+    allowed = {key: details[key] for key in ('send_attempt_id', 'file_sha256',
+               'orders_sha256', 'smtp_data_code', 'server_message_id') if key in details}
+    cur.execute(f"INSERT INTO customer_submission_events (event_id,packet_uuid,event_type,event_at,details_json) VALUES ({params(5)})",
+                (str(uuid.uuid4()), packet_uuid, event_type, utc_now_iso(), json.dumps(allowed, sort_keys=True)))
+
+
+def _yahoo_pilot_accept(sender, app_password, recipient, message, *, host='smtp.mail.yahoo.com', starttls=False):
+    """Observe TLS SMTP acceptance directly. Never retry or expose provider errors."""
+    import ssl
+    import time
+    from email import policy
+    deadline = time.monotonic() + 45
+    smtp = None
+    accepted = False
+    try:
+        context = ssl.create_default_context()
+        if starttls:
+            smtp = smtplib.SMTP(host, 587, timeout=10)
+        else:
+            smtp = _YAHOO_SMTP_FACTORY(host, 465, timeout=10, context=context)
+
+        def budget():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Yahoo pilot time budget exhausted')
+            sock = getattr(smtp, 'sock', None)
+            if sock is not None:
+                sock.settimeout(min(10, remaining))
+        budget()
+        code, _ = smtp.ehlo()
+        if code != 250:
+            return False
+        if starttls:
+            budget()
+            code, _ = smtp.starttls(context=context)
+            if code != 220:
+                return False
+            budget()
+            code, _ = smtp.ehlo()
+            if code != 250:
+                return False
+        budget()
+        smtp.login(sender, app_password)
+        budget()
+        code, _ = smtp.mail(sender)
+        if code != 250:
+            return False
+        budget()
+        code, _ = smtp.rcpt(recipient)
+        if code not in (250, 251):
+            return False
+        budget()
+        code, _ = smtp.data(message.as_bytes(policy=policy.SMTP))
+        accepted = code == 250
+    except Exception:
+        # Provider exceptions can contain credentials or message data. Never log.
+        accepted = False
+    finally:
+        if smtp is not None:
+            try:
+                sock = getattr(smtp, 'sock', None)
+                if sock is not None:
+                    sock.settimeout(2)
+                smtp.quit()
+            except Exception:
+                pass  # QUIT failure cannot undo a recorded DATA 250 observation.
+            try:
+                smtp.close()
+            except Exception:
+                pass
+    return accepted
+
+
+def _yahoo_pilot_test_customer(payload, *, provider="Yahoo"):
+    """Verified test-inbox owner, not a paid refund entitlement or reviewer."""
+    if not (APP_VERSION.endswith('-STAGING') and _auth_ready() and
+            os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected'):
+        raise _SubmissionAuthorizationFailure('Staging email testing is unavailable.', 503)
+    _verify_runtime_schema()
+    principal = _auth_current_customer()
+    if not principal:
+        raise _SubmissionAuthorizationFailure('Sign in before preparing an email test.', 401)
+    email = normalize_email(principal.get('email', ''))
+    allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
+    if provider == 'Gmail':
+        allowed = {_GMAIL_PILOT_SENDER}
+    elif provider == 'iCloud':
+        allowed = {_ICLOUD_PILOT_RECIPIENT}
+    if not any(allowed):
+        raise _SubmissionAuthorizationFailure('Test mailboxes have not been configured.', 503)
+    if email not in allowed or (payload.get('email') and normalize_email(payload['email']) != email):
+        raise _SubmissionAuthorizationFailure('This sign-in is not an approved test inbox.', 403)
+    claimed = payload.get('customer_uuid') or payload.get('owner_customer_uuid')
+    if claimed and claimed != principal['customer_uuid']:
+        raise _SubmissionAuthorizationFailure('The test must belong to this sign-in.', 403)
+    return principal['customer_uuid'], email
+
+
+@app.route('/customer/submission-manager/yahoo-pilot-prepare', methods=['POST'])
+def submission_manager_yahoo_pilot_prepare():
+    return _prepare_email_pilot()
+
+
+@app.route('/customer/submission-manager/gmail-pilot-prepare', methods=['POST'])
+def submission_manager_gmail_pilot_prepare():
+    return _prepare_email_pilot(provider="Gmail")
+
+
+@app.route('/customer/submission-manager/icloud-pilot-prepare', methods=['POST'])
+def submission_manager_icloud_pilot_prepare():
+    return _prepare_email_pilot(provider='iCloud')
+
+
+def _prepare_email_pilot(*, provider="Yahoo"):
+    """Prepare the server-pinned fictional packet. Never send or approve proof."""
+    if request.content_length is None or request.content_length > 4096:
+        return jsonify(ok=False, error='A bounded test-preparation request is required.'), 413
+    payload, error = require_json_payload()
+    if error:
+        return jsonify(ok=False, error=error), 400
+    try:
+        customer_uuid, _ = _yahoo_pilot_test_customer(payload, provider=provider)
+        sender = _auth_email(payload.get('sender_email'))
+        allowed = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
+        if provider == 'iCloud':
+            if not sender.endswith('@icloud.com') or sender != _ICLOUD_PILOT_SENDER:
+                raise PermissionError('Choose the approved iCloud test sender.')
+            bundled_packet = _ICLOUD_PILOT_BUNDLED_PACKET
+            fixtures = {_ICLOUD_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE}
+        elif provider == 'Gmail':
+            if not sender.endswith('@gmail.com') or sender != _GMAIL_PILOT_SENDER:
+                raise PermissionError('Choose the approved Gmail test sender.')
+            bundled_packet = _GMAIL_PILOT_BUNDLED_PACKET
+            fixtures = {_GMAIL_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE}
+        else:
+            if not sender or not sender.endswith('@yahoo.com') or sender not in allowed:
+                raise PermissionError('Choose the approved Yahoo test sender.')
+            bundled_packet = _YAHOO_PILOT_BUNDLED_PACKET
+            fixtures = _YAHOO_PILOT_TEST_FIXTURES
+        item = _submission_validate_registration(dict(bundled_packet, amazon_account_email=sender))
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (customer_uuid,))
+            cur.execute(f'SELECT * FROM customer_submission_packets WHERE customer_uuid={param()} AND forwarder={param()} AND profile_key={param()} AND packet_id={param()} FOR UPDATE',
+                        (customer_uuid, item['forwarder'], item['profile_key'], item['packet_id']))
+            old = _submission_row(cur, cur.fetchone())
+            if old:
+                if normalize_email(old['amazon_account_email']) != sender:
+                    raise PermissionError('The existing test belongs to a different Yahoo profile.')
+                _, orders_hash = _proof_orders_snapshot(cur, old)
+                fixture = fixtures[item['packet_id']]
+                if old['file_sha256'] != fixture['file_sha256'] or orders_hash != fixture['orders_sha256']:
+                    raise RuntimeError('Existing test data changed. Do not overwrite it or resend.')
+                conn.commit()
+                return jsonify(ok=True, packet_uuid=old['packet_uuid'], status=old['status'], already_registered=True)
+            uid = str(uuid.uuid4()); now = utc_now_iso()
+            cur.execute(f'INSERT INTO customer_submission_packets (packet_uuid,customer_uuid,forwarder,profile_key,amazon_account_email,packet_id,packet_type,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at) VALUES ({params(14)})',
+                        (uid,customer_uuid,item['forwarder'],item['profile_key'],sender,item['packet_id'],item['packet_type'],item['invoice_reference'],item['file_name'],item['file_sha256'],item['requested_total'],'NEEDS_PROOF_REVIEW',now,now))
+            for order_id, amount in item['orders']:
+                cur.execute(f'INSERT INTO customer_submission_packet_orders (packet_uuid,amazon_order_id,requested_tax) VALUES ({params(3)})',(uid,order_id,amount))
+            _yahoo_pilot_event(cur,uid,f'{provider.upper()}_PILOT_PREPARED',{'file_sha256':item['file_sha256']})
+            conn.commit()
+            return jsonify(ok=True,packet_uuid=uid,status='NEEDS_PROOF_REVIEW',already_registered=False)
+        except Exception:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/yahoo-pilot-send', methods=['POST'])
+def submission_manager_yahoo_pilot_send():
+    return _send_email_pilot()
+
+
+@app.route('/customer/submission-manager/gmail-pilot-send', methods=['POST'])
+def submission_manager_gmail_pilot_send():
+    return _send_email_pilot(provider="Gmail")
+
+
+@app.route('/customer/submission-manager/icloud-pilot-send', methods=['POST'])
+def submission_manager_icloud_pilot_send():
+    return _send_email_pilot(provider='iCloud')
+
+
+def _send_email_pilot(*, provider="Yahoo"):
+    """OFF by default. Reviewed synthetic pilot only, never an Amazon recipient."""
+    if not (APP_VERSION.endswith('-STAGING') and
+            os.environ.get('SHIPTAXREFUND_SCHEMA_MODE', '').strip().lower() == 'protected' and
+            safe_bool(os.environ.get(f'SHIPTAXREFUND_STAGING_{provider.upper()}_PILOT_ENABLED', ''))):
+        return jsonify(ok=False, error=f'{provider} pilot sending is disabled.'), 503
+    if request.content_length is None or request.content_length > _YAHOO_PILOT_MAX_REQUEST:
+        return jsonify(ok=False, error='A bounded PDF request is required.'), 413
+    payload, error = require_json_payload()
+    if error:
+        return jsonify(ok=False, error=error), 400
+    password = payload.pop(f'{provider.lower()}_app_password', None)
+    pdf = None
+    message = None
+    try:
+        import base64
+        from email.utils import make_msgid
+        if not isinstance(password, str) or not 1 <= len(password) <= 256:
+            raise ValueError('Yahoo app password is required for this send only.')
+        if payload.get('credential_use_consent') != f'USE_ONCE_FOR_{provider.upper()}_PILOT_SEND':
+            raise PermissionError('Explicit one-send credential consent is required.')
+        customer_uuid, owner_email = _yahoo_pilot_test_customer(payload, provider=provider)
+        sender = _auth_email(payload.get('sender_email'))
+        recipient = _auth_email(payload.get('recipient_email'))
+        allowed_senders = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_SENDERS', '').split(',')}
+        allowed_recipients = {_auth_email(x) for x in os.environ.get('SHIPTAXREFUND_STAGING_YAHOO_PILOT_RECIPIENTS', '').split(',')}
+        if provider == 'iCloud':
+            if (not sender.endswith('@icloud.com') or not recipient.endswith('@gmail.com') or
+                    sender != _ICLOUD_PILOT_SENDER or recipient != owner_email or
+                    recipient != _ICLOUD_PILOT_RECIPIENT):
+                raise PermissionError('Only the approved iCloud-to-Gmail test pair is permitted.')
+        elif provider == 'Gmail':
+            if (not sender.endswith('@gmail.com') or not recipient.endswith('@yahoo.com') or
+                    sender != owner_email or sender != _GMAIL_PILOT_SENDER or recipient != _GMAIL_PILOT_RECIPIENT):
+                raise PermissionError('Only the approved Gmail-to-Yahoo test pair is permitted.')
+        else:
+            if not sender or sender not in allowed_senders or not sender.endswith('@yahoo.com'):
+                raise PermissionError('Sender is not an approved Yahoo pilot mailbox.')
+            if recipient != owner_email:
+                raise PermissionError('Send this test only to your own signed-in inbox.')
+            domain = recipient.rsplit('@', 1)[-1] if recipient else ''
+            if not recipient or recipient not in allowed_recipients or 'amazon' in domain:
+                raise PermissionError('Only approved non-Amazon pilot recipients are permitted.')
+        encoded = payload.pop('pdf_base64', None)
+        if not isinstance(encoded, str) or len(encoded) > ((_YAHOO_PILOT_MAX_PDF + 2) // 3) * 4:
+            raise ValueError('A PDF within the pilot size limit is required.')
+        try:
+            pdf = base64.b64decode(encoded, validate=True)
+        except Exception:
+            raise ValueError('PDF encoding is invalid.') from None
+        encoded = None
+        if not pdf.startswith(b'%PDF-') or len(pdf) > _YAHOO_PILOT_MAX_PDF:
+            raise ValueError('A PDF within the pilot size limit is required.')
+        file_hash = hashlib.sha256(pdf).hexdigest()
+        packet_uuid = clean_text(payload.get('packet_uuid', ''), 120)
+        if not packet_uuid:
+            raise ValueError('Reviewed packet is required.')
+        _verify_runtime_schema()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            cur.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (customer_uuid,))
+            packet = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
+            if not str(packet['packet_id']).startswith(f'{provider.upper()}-PILOT-'):
+                raise PermissionError('Use a separately prepared Yahoo pilot packet, not a real refund packet.')
+            if packet['status'] not in ('NEEDS_PROOF_REVIEW', 'READY_TO_SEND'):
+                raise RuntimeError('Packet is not ready for a new send. Review existing attempts before continuing.')
+            if packet['file_sha256'] != file_hash:
+                raise RuntimeError('PDF changed after review.')
+            if normalize_email(packet['amazon_account_email']) != sender:
+                raise PermissionError('Yahoo sender must match the reviewed account profile.')
+            # Email transport test, not a real-document approval. No reviewer
+            # identity or approval is created. Ordinary refund sends retain their
+            # existing independent proof-review guard.
+            orders, orders_hash = _proof_orders_snapshot(cur, packet)
+            fixtures = {
+                'Yahoo': _YAHOO_PILOT_TEST_FIXTURES,
+                'Gmail': {_GMAIL_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE},
+                'iCloud': {_ICLOUD_PILOT_PACKET_ID: _GMAIL_PILOT_FIXTURE},
+            }
+            fixture = fixtures[provider].get(packet['packet_id'])
+            if (payload.get('pilot_test_acknowledgement') != 'FICTIONAL_ATTACHMENT_TEST_ONLY' or
+                    not fixture or fixture['file_sha256'] != file_hash or
+                    fixture['orders_sha256'] != orders_hash or
+                    fixture['requested_total'] != str(packet['requested_total'])):
+                raise PermissionError('Only the exact bundled fictional test packet is permitted.')
+            if _submission_locked_order_conflict(cur, packet):
+                raise RuntimeError('An order already has an active or sent packet.')
+            # Build the message from reviewed server data, not arbitrary client MIME.
+            message = EmailMessage()
+            message['From'] = sender
+            message['To'] = recipient
+            message['Subject'] = 'ShipTaxRefund TEST ONLY - ' + packet['packet_id']
+            message['Message-ID'] = make_msgid(domain='shiptaxrefund.invalid')
+            lines = ['TEST ONLY. No Amazon request is being submitted.', '', 'Fictional test orders:']
+            lines.extend(row['amazon_order_id'] + ' | ' + row['requested_tax'] for row in orders)
+            lines.extend(['', 'Total: ' + packet['requested_total']])
+            message.set_content('\n'.join(lines))
+            message.add_attachment(pdf, maintype='application', subtype='pdf', filename='fictional-email-test.pdf')
+            attempt_id = str(uuid.uuid4())
+            now = utc_now_iso()
+            cur.execute(f"UPDATE customer_submission_packets SET status='SEND_IN_PROGRESS',send_attempt_id={param()},attempted_at={param()},sender_email={param()},recipient_email={param()},mail_provider={param()},updated_at={param()} WHERE packet_uuid={param()}",
+                        (attempt_id, now, sender, recipient, f'{provider.lower()}_smtp', now, packet_uuid))
+            _yahoo_pilot_event(cur, packet_uuid, f'{provider.upper()}_PILOT_RESERVED',
+                              {'send_attempt_id': attempt_id, 'file_sha256': file_hash, 'orders_sha256': orders_hash})
+            conn.commit()  # Durable reservation before any SMTP IO.
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if provider == 'iCloud':
+            accepted = _yahoo_pilot_accept(sender, password, recipient, message,
+                                          host='smtp.mail.me.com', starttls=True)
+        elif provider == 'Gmail':
+            accepted = _yahoo_pilot_accept(sender, password, recipient, message, host='smtp.gmail.com')
+        else:
+            accepted = _yahoo_pilot_accept(sender, password, recipient, message)
+        password = None
+        status = 'SENT' if accepted else 'SEND_UNCERTAIN'
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            current = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
+            if current['send_attempt_id'] != attempt_id or current['status'] != 'SEND_IN_PROGRESS':
+                raise RuntimeError('Send reservation changed; reconciliation required.')
+            cur.execute(f'UPDATE customer_submission_packets SET status={param()},updated_at={param()} WHERE packet_uuid={param()}',
+                        (status, utc_now_iso(), packet_uuid))
+            _yahoo_pilot_event(cur, packet_uuid, f'{provider.upper()}_PILOT_ACCEPTED' if accepted else f'{provider.upper()}_PILOT_UNCERTAIN',
+                              {'send_attempt_id': attempt_id, 'smtp_data_code': 250 if accepted else None,
+                               'server_message_id': str(message['Message-ID']),
+                               'file_sha256': file_hash, 'orders_sha256': orders_hash})
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            return jsonify(ok=False, status='SEND_UNCERTAIN', provider_confirmed=False,
+                           error='Send outcome could not be recorded. Do not resend; reconciliation is required.'), 202
+        finally:
+            conn.close()
+        return jsonify(ok=accepted, status=status, packet_uuid=packet_uuid,
+                       send_attempt_id=attempt_id, provider_confirmed=accepted,
+                       delivery_confirmed=False, pilot_only=True), 200 if accepted else 202
+    except (_SubmissionAuthorizationFailure, PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        return _submission_endpoint_errors(exc)
+    except Exception:
+        # Do not emit a traceback for a request carrying a transient credential.
+        return jsonify(ok=False, error='Yahoo pilot operation could not be confirmed. Do not resend automatically.'), 503
+    finally:
+        password = None
+        pdf = None
+        message = None
+        # Python cannot guarantee immediate memory erasure of immutable strings.
+        # No credential or PDF bytes are written to storage or audit records.
+
+
+@app.route('/customer/submission-manager/confirm-sent', methods=['POST'])
+def submission_manager_confirm_sent():
+    """Gate6 FAIL-CLOSED preview: no client claim may set a packet SENT.
+
+    This endpoint deliberately leaves a send unconfirmed because the actual
+    backend cannot independently verify Yahoo SMTP acceptance, a Gmail API
+    response, or a Microsoft Graph response from an arbitrary client payload.
+    This legacy client-confirmation route never certifies provider acceptance.
+    The separate Yahoo pilot route observes SMTP itself and remains disabled
+    until explicitly configured for reviewed test packets.
+    """
+    payload, error = require_json_payload()
+    if error:
+        return jsonify({'ok': False, 'error': error}), 400
+    try:
+        customer_uuid, _ = _submission_authorize(payload)
+        packet_uuid = clean_text(payload.get('packet_uuid', ''))
+        attempt_id = clean_text(payload.get('send_attempt_id', ''))
+        message_id = clean_text(payload.get('provider_message_id') or payload.get('gmail_message_id', ''), 250)
+        claimed_receipt_type = clean_text(payload.get('transport_receipt_type') or '', 60)
+        if not (packet_uuid and attempt_id and message_id):
+            raise ValueError('packet_uuid, send_attempt_id and provider Message-ID are required.')
+        if claimed_receipt_type not in ('SMTP_SERVER_ACCEPTED', 'PROVIDER_API_ACCEPTED'):
+            raise ValueError('Supported client-reported transport receipt type is required.')
+        init_db()
+        conn = get_db_connection()
+        try:
+            cur = _submission_cursor(conn)
+            if not postgres_available():
+                cur.execute('BEGIN IMMEDIATE')
+            packet = _submission_get_packet_for_customer(cur, customer_uuid, packet_uuid, lock=True)
+            if packet['send_attempt_id'] != attempt_id:
+                raise RuntimeError('Attempt ID mismatch; no send confirmation recorded.')
+            if packet['status'] == 'SENT':
+                # Never overwrite immutable earlier history, and never assert
+                # that a previous client-confirmed SENT state was independently proven.
+                raise RuntimeError('Historical SENT status requires separate receipt audit.')
+            if packet['status'] not in ('SEND_IN_PROGRESS', 'SEND_UNCERTAIN'):
+                raise RuntimeError('Packet is not in a confirmable send-attempt state.')
+            if packet['status'] == 'SEND_IN_PROGRESS':
+                now = utc_now_iso()
+                cur.execute(
+                    f"UPDATE customer_submission_packets SET status='SEND_UNCERTAIN',updated_at={param()} "
+                    f"WHERE packet_uuid={param()} AND customer_uuid={param()}",
+                    (now, packet_uuid, customer_uuid),
+                )
+                # Only provenance category, no unverified mail-provider ID or mail body.
+                _submission_event(
+                    cur, packet_uuid, 'CLIENT_CONFIRMATION_UNVERIFIED',
+                    {'reason': 'Independent provider acceptance was not verified by this server.'},
+                )
+            conn.commit()
+            return jsonify({
+                'ok': False,
+                'status': 'SEND_UNCERTAIN',
+                'provider_confirmed': False,
+                'error': 'Claimed provider acceptance is not independently verified.',
+                'version': APP_VERSION,
+            }), 202
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/send-uncertain', methods=['POST'])
+def submission_manager_send_uncertain():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        attempt_id=clean_text(payload.get('send_attempt_id',''))
+        init_db();conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if not postgres_available():cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if packet['send_attempt_id']!=attempt_id:raise RuntimeError('Attempt ID mismatch.')
+            if packet['status']=='SEND_UNCERTAIN':
+                conn.commit();return jsonify({'ok':True,'status':'SEND_UNCERTAIN','version':APP_VERSION})
+            if packet['status']!='SEND_IN_PROGRESS':raise RuntimeError('The packet is not currently sending.')
+            now=utc_now_iso()
+            cur.execute(f"UPDATE customer_submission_packets SET status='SEND_UNCERTAIN',updated_at={param()} WHERE packet_uuid={param()}",(now,packet_uuid))
+            _submission_event(cur,packet_uuid,'SEND_RESULT_UNCERTAIN')
+            conn.commit();return jsonify({'ok':True,'status':'SEND_UNCERTAIN','version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+@app.route('/customer/submission-manager/archive', methods=['POST'])
+def submission_manager_archive():
+    payload,error=require_json_payload()
+    if error:return jsonify({'ok':False,'error':error}),400
+    try:
+        customer_uuid,_=_submission_authorize(payload)
+        packet_uuid=clean_text(payload.get('packet_uuid',''))
+        init_db();conn=get_db_connection()
+        try:
+            cur=_submission_cursor(conn)
+            if not postgres_available():cur.execute('BEGIN IMMEDIATE')
+            packet=_submission_get_packet_for_customer(cur,customer_uuid,packet_uuid,lock=True)
+            if packet['status']!='SENT':raise RuntimeError('Only mail-provider-accepted packets can be archived.')
+            now=utc_now_iso()
+            cur.execute(f'UPDATE customer_submission_packets SET archived_at={param()},updated_at={param()} WHERE packet_uuid={param()}',(now,now,packet_uuid))
+            _submission_event(cur,packet_uuid,'LOCAL_ARCHIVE_CONFIRMED',{'archive_status':'archived'})
+            conn.commit();return jsonify({'ok':True,'archived_at':now,'version':APP_VERSION})
+        except Exception:conn.rollback();raise
+        finally:conn.close()
+    except Exception as exc:return _submission_endpoint_errors(exc)
+
+
+
+# -----------------------------------------------------------------------------
+# V10.29.4 - Opt-in, STAGING-ONLY email code authentication.
+#
+# A validated mailbox is not proof of Amazon ownership, a paid entitlement, or
+# authorization to send claims. Thus these routes are READ ONLY except for
+# authentication state, and existing refund submission APIs stay unchanged.
+#
+# Starts DISABLED in every environment. Requires an independently provisioned
+# application-owned mail sender (NOT the customer's Yahoo app password) and a
+# random HMAC pepper. No email, account, or DB mutation occurs at import time.
+# -----------------------------------------------------------------------------
+
+_AUTH_EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}\Z")
+_AUTH_CHALLENGE_MAX_ATTEMPTS = 5
+_AUTH_CHALLENGE_LIFETIME = timedelta(minutes=10)
+_AUTH_SESSION_LIFETIME = timedelta(days=30)
+
+
+def _auth_enabled():
+    return APP_VERSION.endswith("-PRODUCTION") and safe_bool(os.environ.get("SHIPTAXREFUND_AUTH_ENABLED", ""))
+
+
+def _auth_pepper():
+    value = os.environ.get("SHIPTAXREFUND_AUTH_HMAC_KEY", "")
+    return value.encode("utf-8") if len(value) >= 32 else b""
+
+
+def _auth_email(value):
+    value = normalize_email(value)
+    return value if len(value) <= 254 and _AUTH_EMAIL_RE.fullmatch(value) else ""
+
+
+def _auth_email_allowlisted(email):
+    # In STAGING, explicitly authorize only the pilot mailboxes. This prevents
+    # a publicly accessible test API from becoming an arbitrary mail sender.
+    configured = os.environ.get("SHIPTAXREFUND_AUTH_ALLOWED_EMAILS", "")
+    allowed = {_auth_email(item) for item in configured.split(",")}
+    return bool(email) and email in allowed
+
+
+def _auth_hmac(purpose, value):
+    pepper = _auth_pepper()
+    if not pepper:
+        raise RuntimeError("Authentication is not configured.")
+    return hmac.new(pepper, (purpose + "|" + value).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _auth_email_provider():
+    # Explicit selection only. Legacy SMTP option stays for private paid-instance
+    # compatibility, but Render Free's SMTP ports cannot be used.
+    return os.environ.get("SHIPTAXREFUND_AUTH_EMAIL_PROVIDER", "smtp").strip().lower()
+
+
+def _auth_resend_settings():
+    api_key = os.environ.get("SHIPTAXREFUND_AUTH_RESEND_API_KEY", "").strip()
+    from_addr = _auth_email(os.environ.get("SHIPTAXREFUND_AUTH_RESEND_FROM", ""))
+    # This staging app is exclusively for ShipTaxRefund's approved sender.
+    # Keys remain SERVER-side on Render, never in the customer's desktop.
+    if (not api_key.startswith("re_") or not 15 <= len(api_key) <= 300 or
+            any(ch.isspace() for ch in api_key) or
+            from_addr != "support@shiptaxrefund.com"):
+        return None
+    return api_key, from_addr
+
+
+def _auth_smtp_settings():
+    host = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_HOST", "").strip()
+    mode = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_TLS", "ssl").strip().lower()
+    from_addr = _auth_email(os.environ.get("SHIPTAXREFUND_AUTH_SMTP_FROM", ""))
+    username = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_USERNAME", "").strip()
+    password = os.environ.get("SHIPTAXREFUND_AUTH_SMTP_PASSWORD", "")
+    try:
+        port = int(os.environ.get("SHIPTAXREFUND_AUTH_SMTP_PORT", "465" if mode == "ssl" else "587"))
+    except (ValueError, TypeError):
+        port = 0
+    if not all((host, from_addr, username, password, 1 <= port <= 65535)) or mode not in {"ssl", "starttls"}:
+        return None
+    return host, port, from_addr, username, password, mode
+
+
+def _auth_mail_configured():
+    provider = _auth_email_provider()
+    if provider == "resend":
+        return _auth_resend_settings() is not None
+    if provider == "smtp":
+        return _auth_smtp_settings() is not None
+    return False
+
+
+class _NoResendRedirects(_ResendRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _resend_https_open(req, timeout=20):
+    # Do not follow any HTTP 30x redirects with a Bearer secret attached.
+    return _resend_build_opener(_NoResendRedirects()).open(req, timeout=timeout)
+
+
+class _ResendDeliveryDiagnostic(Exception):
+    """Only nonsecret failure categories; never retain HTTP response bodies or headers."""
+    def __init__(self, category, http_status=None, exception_type=None, reason_code=None):
+        super().__init__(category)
+        self.category = category
+        self.http_status = http_status
+        self.exception_type = exception_type
+        self.reason_code = reason_code
+
+
+def _resend_safe_exception_type(exc):
+    # urllib often wraps the real reason in URLError.reason; type names only.
+    inner = getattr(exc, "reason", None)
+    typ = type(inner).__name__ if inner is not None else type(exc).__name__
+    return typ if typ in {"TimeoutError", "SSLError", "gaierror", "ConnectionRefusedError",
+                          "ConnectionResetError", "BrokenPipeError", "URLError",
+                          "PermissionError", "ConnectionAbortedError"} else "OtherNetworkError"
+
+
+def _resend_403_reason_code(http_error):
+    """Classify a Resend 403 without returning or logging provider-supplied text.
+
+    Provider response bodies may contain account or recipient details. They are
+    held only in process memory for this classification and never persisted.
+    """
+    try:
+        raw = http_error.read(4097)
+        if len(raw) > 4096:
+            return "provider_error_body_oversized"
+        detail = json.loads(raw.decode("utf-8"))
+        if not isinstance(detail, dict):
+            return "provider_error_not_object"
+        name = detail.get("name", "")
+        message = detail.get("message", "")
+        if not isinstance(name, str) or not isinstance(message, str):
+            return "provider_error_unexpected_fields"
+        name = name[:80].lower().strip()
+        message = message[:1200].lower()
+        if name == "suspended_api_key" or "api key is suspended" in message:
+            return "api_key_suspended"
+        if name == "restricted_api_key" or "api key is not active" in message:
+            return "api_key_not_active"
+        if name == "invalid_permission" or "missing required scopes" in message:
+            return "insufficient_api_permissions"
+        if "only send testing emails" in message or "send testing emails to your own" in message:
+            return "testing_recipient_restriction"
+        if "domain is not verified" in message or "domain not verified" in message:
+            return "sender_domain_not_verified"
+        if name == "validation_error":
+            return "provider_validation_other"
+        return "provider_403_other"
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return "provider_error_unreadable"
+    finally:
+        try:
+            http_error.close()
+        except Exception:
+            pass
+
+
+def _auth_send_resend(email, code, challenge_uuid, opener=None):
+    settings = _auth_resend_settings()
+    if not settings:
+        raise RuntimeError("Resend authentication email is not configured")
+    if not _auth_email_allowlisted(_auth_email(email)):
+        raise RuntimeError("Recipient not allowlisted")
+    if not re.fullmatch(r"[0-9]{6}", str(code)):
+        raise RuntimeError("Invalid confirmation code")
+    if not re.fullmatch(r"[a-fA-F0-9-]{36}", str(challenge_uuid)):
+        raise RuntimeError("Invalid challenge reference")
+    api_key, from_addr = settings
+    message = {
+        "from": from_addr,
+        "to": [email],
+        "subject": "ShipTaxRefund sign-in code",
+        "text": (
+            "Your ShipTaxRefund sign-in code is " + code + ".\n"
+            "It expires in 10 minutes. If you did not request this, ignore it.\n"
+            "This code never authorizes an Amazon refund submission.\n"
+        ),
+    }
+    request = _ResendRequest(
+        "https://api.resend.com/emails",
+        data=json.dumps(message, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "shiptaxrefund-staging/1.0",
+            "Idempotency-Key": "shiptaxrefund-staging-login-" + challenge_uuid,
+        },
+        method="POST",
+    )
+    # No automatic HTTP retry. A timeout can occur *after* Resend accepts a send;
+    # marking UNKNOWN/FAILED in local challenge prevents issuing that code.
+    # The provider idempotency key also prevents duplicates for this challenge.
+    try:
+        with (opener or _resend_https_open)(request, timeout=20) as response:
+            status = int(response.status)
+            data = response.read(16385)
+        if status not in (200, 201):
+            raise _ResendDeliveryDiagnostic("resend_unexpected_http_status", http_status=status)
+        if len(data) > 16384:
+            raise _ResendDeliveryDiagnostic("resend_response_too_large")
+        try:
+            result = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise _ResendDeliveryDiagnostic("resend_invalid_json") from None
+        if not isinstance(result, dict) or not re.fullmatch(r"[a-zA-Z0-9-]{10,100}", str(result.get("id", ""))):
+            raise _ResendDeliveryDiagnostic("resend_missing_acceptance_id")
+    except _ResendHTTPError as exc:
+        # The provider's raw response is NEVER logged or sent to the desktop.
+        # 403 receives a bounded, allowlisted reason code for diagnostic use.
+        status = int(exc.code)
+        reason_code = _resend_403_reason_code(exc) if status == 403 else None
+        app.logger.error("AUTH_TRACE stage=resend_http status=%s reason=%s",
+                         status, reason_code or "not_classified")
+        raise _ResendDeliveryDiagnostic("resend_http_rejected", http_status=status,
+                                        reason_code=reason_code) from None
+    except (_ResendURLError, TimeoutError, UnicodeError, OSError) as exc:
+        safe_type = _resend_safe_exception_type(exc)
+        app.logger.error("AUTH_TRACE stage=resend_transport type=%s", safe_type)
+        raise _ResendDeliveryDiagnostic("resend_transport_failure", exception_type=safe_type) from None
+    return True
+
+def _auth_ready(require_email=False):
+    # Production sign-in requires explicit activation and the protected schema.
+    if not _auth_enabled() or os.environ.get("SHIPTAXREFUND_SCHEMA_MODE", "").strip().lower() != "protected":
+        return False
+    if not _auth_pepper():
+        return False
+    if not (postgres_available() or sqlite_fallback_allowed()):
+        return False
+    return not require_email or _auth_mail_configured()
+
+
+def _auth_json_error(status, reason):
+    return jsonify({"ok": False, "error": reason, "version": APP_VERSION}), status
+
+
+def _auth_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if postgres_available() else conn.cursor()
+
+
+def _auth_send_mail(email, code, challenge_uuid=None):
+    if _auth_email_provider() == "resend":
+        return _auth_send_resend(email, code, challenge_uuid)
+    if _auth_email_provider() != "smtp":
+        raise RuntimeError("Authentication email provider is unsupported")
+    settings = _auth_smtp_settings()
+    if not settings:
+        raise RuntimeError("Authentication email is not configured.")
+    host, port, from_addr, username, password, mode = settings
+    message = EmailMessage()
+    message["From"] = from_addr
+    message["To"] = email
+    message["Subject"] = "ShipTaxRefund sign-in code"
+    message.set_content(
+        "Your ShipTaxRefund sign-in code is " + code + ".\n"
+        "It expires in 10 minutes. If you did not request this, ignore it.\n"
+        "This code never authorizes an Amazon refund submission.\n"
+    )
+    # TLS required; deliberately uses an application-owned mailbox, not the
+    # Yahoo account proven in the completed email-delivery proof of concept.
+    if mode == "ssl":
+        with smtplib.SMTP_SSL(host, port, timeout=20) as conn:
+            conn.login(username, password)
+            conn.send_message(message)
+    else:
+        with smtplib.SMTP(host, port, timeout=20) as conn:
+            conn.ehlo()
+            conn.starttls()
+            conn.ehlo()
+            conn.login(username, password)
+            conn.send_message(message)
+
+
+def _auth_lock_request(cur, email):
+    # The database transaction and per-email advisory lock serialize
+    # rate-limited code requests even across several Render workers.
+    if postgres_available():
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_auth_hmac("rate-email", email),))
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+
+
+def _auth_rate_allow(cur, email):
+    now = utc_now()
+    hour = (now - timedelta(hours=1)).isoformat()
+    day = (now - timedelta(days=1)).isoformat()
+    email_key = _auth_hmac("rate-email", email)
+    # Deliberately uses WSGI remote address, not untrusted X-Forwarded-For.
+    source_key = _auth_hmac("rate-ip", str(request.remote_addr or "unknown"))
+    for key, since, maximum in ((email_key, hour, 5), (email_key, day, 12), (source_key, hour, 60)):
+        cur.execute(f"SELECT COUNT(*) AS amount FROM customer_auth_rate_events WHERE rate_key={param()} AND created_at>={param()}", (key, since))
+        if int(scalar(cur.fetchone(), 0)) >= maximum:
+            return False
+    for key in (email_key, source_key):
+        cur.execute(f"INSERT INTO customer_auth_rate_events (event_uuid, rate_key, created_at) VALUES ({params(3)})", (str(uuid.uuid4()), key, now.isoformat()))
+    return True
+
+
+@app.route("/customer/auth/request-code", methods=["POST"])
+def customer_auth_request_code():
+    if not _auth_ready(require_email=True):
+        app.logger.warning("AUTH_TRACE stage=request status=not_ready")
+        return _auth_json_error(503, "Email sign-in is not enabled or configured.")
+    payload, error = require_json_payload()
+    if error or not isinstance(payload, dict):
+        return _auth_json_error(400, "Invalid JSON payload.")
+    email = _auth_email(payload.get("email", ""))
+    if not email:
+        app.logger.info("AUTH_TRACE stage=request status=invalid_email")
+        return _auth_json_error(400, "Valid email is required.")
+    # Non-allowlisted pilot mailboxes receive the same accepted response as
+    # normal requests, but no code is generated or sent.
+    if not _auth_email_allowlisted(email):
+        app.logger.info("AUTH_TRACE stage=request status=suppressed_not_allowlisted")
+        return jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION}), 202
+    # This identical response intentionally discloses no account existence.
+    accepted = jsonify({"ok": True, "accepted": True, "message": "If eligible, a sign-in code will be emailed.", "version": APP_VERSION})
+    code = "{:06d}".format(secrets.randbelow(1000000))
+    challenge_uuid = str(uuid.uuid4())
+    now = utc_now()
+    init_db()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        _auth_lock_request(cur, email)
+        if not _auth_rate_allow(cur, email):
+            conn.commit()
+            app.logger.info("AUTH_TRACE stage=request status=suppressed_rate_limited")
+            return accepted, 202
+        cur.execute(f"INSERT INTO customer_auth_challenges (challenge_uuid,email,code_hash,created_at,expires_at,attempts,consumed_at,send_status) VALUES ({params(8)})",
+                    (challenge_uuid, email, _auth_hmac("code:" + challenge_uuid, code), now.isoformat(),
+                     (now + _AUTH_CHALLENGE_LIFETIME).isoformat(), 0, "", "PENDING"))
+        conn.commit()
+        app.logger.info("AUTH_TRACE stage=request status=challenge_saved")
+    except Exception as exc:
+        conn.rollback()
+        app.logger.error("AUTH_TRACE stage=request status=database_failure exception=%s", type(exc).__name__)
+        app.logger.error("Authentication request failed before sending (details withheld)")
+        return _auth_json_error(503, "Authentication service is temporarily unavailable.")
+    finally:
+        conn.close()
+
+    try:
+        _auth_send_mail(email, code, challenge_uuid=challenge_uuid)
+        app.logger.info("AUTH_TRACE stage=provider status=accepted")
+    except Exception as exc:
+        # Never log passwords, codes, message bodies, or SMTP raw responses.
+        app.logger.error("AUTH_TRACE stage=provider status=not_confirmed exception=%s", type(exc).__name__)
+        app.logger.error("Authentication email not confirmed: %s", type(exc).__name__)
+        conn = get_db_connection()
+        try:
+            cur = _auth_cursor(conn)
+            cur.execute(f"UPDATE customer_auth_challenges SET send_status={param()} WHERE challenge_uuid={param()}", ("FAILED", challenge_uuid))
+            conn.commit()
+        finally:
+            conn.close()
+        # STAGING ONLY: expose a constrained diagnostic category in the error response,
+        # avoiding Render log access. Never include exception text, recipient, OTP,
+        # provider response bodies or headers, API key, HMAC, or DB identifiers.
+        diagnosis = {"category": "email_provider_unclassified"}
+        if isinstance(exc, _ResendDeliveryDiagnostic):
+            diagnosis = {"category": exc.category}
+            if exc.http_status is not None:
+                diagnosis["http_status"] = exc.http_status
+            if exc.exception_type is not None:
+                diagnosis["network_exception_type"] = exc.exception_type
+            if exc.reason_code is not None:
+                diagnosis["provider_reason_code"] = exc.reason_code
+        return jsonify({"ok": False,
+                        "error": "Verification email could not be confirmed. Please try later.",
+                        "version": APP_VERSION,
+                        "email_diagnostic": diagnosis}), 503
+
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_challenges SET send_status={param()} WHERE challenge_uuid={param()}", ("SENT", challenge_uuid))
+        conn.commit()
+    finally:
+        conn.close()
+    app.logger.info("AUTH_TRACE stage=request status=challenge_marked_sent")
+    return accepted, 202
+
+
+@app.route("/customer/auth/verify-code", methods=["POST"])
+def customer_auth_verify_code():
+    if not _auth_ready():
+        return _auth_json_error(503, "Email sign-in is not enabled or configured.")
+    payload, error = require_json_payload()
+    if error or not isinstance(payload, dict):
+        return _auth_json_error(400, "Invalid JSON payload.")
+    email = _auth_email(payload.get("email", ""))
+    code = str(payload.get("code", "") or "").strip()
+    if not email or not re.fullmatch(r"[0-9]{6}", code):
+        return _auth_json_error(400, "Valid email and six-digit code are required.")
+    if not _auth_email_allowlisted(email):
+        return _auth_json_error(401, "Code invalid, expired, or already used.")
+    init_db()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        if not postgres_available():
+            cur.execute("BEGIN IMMEDIATE")
+        sql = f"SELECT * FROM customer_auth_challenges WHERE email={param()} ORDER BY created_at DESC, challenge_uuid DESC LIMIT 1"
+        if postgres_available():
+            sql += " FOR UPDATE"
+        cur.execute(sql, (email,))
+        item = row_to_dict(cur, cur.fetchone())
+        if not item or item["send_status"] != "SENT" or item["consumed_at"] or int(item["attempts"]) >= _AUTH_CHALLENGE_MAX_ATTEMPTS or datetime.fromisoformat(str(item["expires_at"])) < utc_now():
+            conn.rollback()
+            return _auth_json_error(401, "Code invalid, expired, or already used.")
+        cur.execute(f"UPDATE customer_auth_challenges SET attempts=attempts+1 WHERE challenge_uuid={param()}", (item["challenge_uuid"],))
+        expected = _auth_hmac("code:" + item["challenge_uuid"], code)
+        if not hmac.compare_digest(expected, item["code_hash"]):
+            conn.commit()
+            return _auth_json_error(401, "Code invalid, expired, or already used.")
+        cur.execute(f"UPDATE customer_auth_challenges SET consumed_at={param()} WHERE challenge_uuid={param()}", (utc_now_iso(), item["challenge_uuid"]))
+        cur.execute(f"SELECT customer_uuid FROM customers WHERE LOWER(email)={param()}", (email,))
+        prior = row_to_dict(cur, cur.fetchone())
+        customer_uuid = prior["customer_uuid"] if prior else str(uuid.uuid4())
+        if not prior:
+            now = utc_now_iso()
+            cur.execute(f"INSERT INTO customers (customer_uuid,email,display_name,source,created_at,updated_at) VALUES ({params(6)})",
+                        (customer_uuid, email, "", "email_verified", now, now))
+        raw_token = secrets.token_urlsafe(48)
+        now = utc_now()
+        cur.execute(f"INSERT INTO customer_auth_sessions (token_hash,customer_uuid,created_at,expires_at,revoked_at) VALUES ({params(5)})",
+                    (_auth_hmac("session", raw_token), customer_uuid, now.isoformat(), (now + _AUTH_SESSION_LIFETIME).isoformat(), ""))
+        conn.commit()
+        # Return only once; only an HMAC of the token is retained in cloud DB.
+        return jsonify({"ok": True, "access_token": raw_token, "token_type": "Bearer", "expires_at": (now + _AUTH_SESSION_LIFETIME).isoformat(), "email": email, "version": APP_VERSION}), 200
+    except Exception:
+        conn.rollback()
+        app.logger.error("Authentication verification failed internally (details withheld)")
+        return _auth_json_error(503, "Authentication service temporarily unavailable.")
+    finally:
+        conn.close()
+
+
+def _auth_current_customer():
+    if not _auth_ready():
+        return None
+    auth = str(request.headers.get("Authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:].strip()
+    if not 40 <= len(token) <= 200 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        return None
+    row = execute_one(
+        f"SELECT s.customer_uuid,c.email,c.display_name,s.expires_at,s.revoked_at FROM customer_auth_sessions s "
+        f"JOIN customers c ON c.customer_uuid=s.customer_uuid WHERE s.token_hash={param()}",
+        (_auth_hmac("session", token),),
+    )
+    if not row or row["revoked_at"] or datetime.fromisoformat(str(row["expires_at"])) < utc_now():
+        return None
+    return row
+
+
+@app.route("/customer/auth/me", methods=["GET"])
+def customer_auth_me():
+    if not _auth_ready():
+        return _auth_json_error(503, "Email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    return jsonify({"ok": True, "email": customer["email"], "display_name": customer["display_name"], "version": APP_VERSION})
+
+
+@app.route("/customer/auth/packets", methods=["GET"])
+def customer_auth_packets():
+    if not _auth_ready():
+        return _auth_json_error(503, "Email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    rows = execute_all(
+        f"SELECT packet_uuid,packet_id,forwarder,profile_key,invoice_reference,file_name,file_sha256,requested_total,status,created_at,updated_at "
+        f"FROM customer_submission_packets WHERE customer_uuid={param()} ORDER BY created_at DESC LIMIT 500",
+        (customer["customer_uuid"],),
+    )
+    return jsonify({"ok": True, "packets": rows, "version": APP_VERSION})
+
+
+@app.route("/customer/auth/logout", methods=["POST"])
+def customer_auth_logout():
+    if not _auth_ready():
+        return _auth_json_error(503, "Email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    supplied = str(request.headers.get("Authorization", ""))[7:].strip()
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_sessions SET revoked_at={param()} WHERE token_hash={param()} AND customer_uuid={param()}",
+                    (utc_now_iso(), _auth_hmac("session", supplied), customer["customer_uuid"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "version": APP_VERSION})
+
+
+@app.route("/customer/auth/revoke-other-sessions", methods=["POST"])
+def customer_auth_revoke_other_sessions():
+    # Allows a newly verified mailbox owner to revoke credentials on lost PCs.
+    if not _auth_ready():
+        return _auth_json_error(503, "Email sign-in is disabled.")
+    customer = _auth_current_customer()
+    if not customer:
+        return _auth_json_error(401, "Sign-in required or session expired.")
+    supplied = str(request.headers.get("Authorization", ""))[7:].strip()
+    current_hash = _auth_hmac("session", supplied)
+    conn = get_db_connection()
+    try:
+        cur = _auth_cursor(conn)
+        cur.execute(f"UPDATE customer_auth_sessions SET revoked_at={param()} WHERE customer_uuid={param()} AND token_hash<>{param()} AND (revoked_at IS NULL OR revoked_at='')",
+                    (utc_now_iso(), customer["customer_uuid"], current_hash))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 if __name__ == "__main__":
